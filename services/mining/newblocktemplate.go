@@ -13,7 +13,7 @@ import (
 	"github.com/Qitmeer/qitmeer/log"
 	"github.com/Qitmeer/qitmeer/params"
 	"github.com/Qitmeer/qitmeer/services/blkmgr"
-	"github.com/Qitmeer/qitmeer/services/mempool"
+	"golang.org/x/net/context"
 )
 
 // NewBlockTemplate returns a new block template that is ready to be solved
@@ -87,7 +87,7 @@ func NewBlockTemplate(policy *Policy, params *params.Params,
 	sigCache *txscript.SigCache, txSource TxSource, timeSource blockchain.MedianTimeSource,
 	blockManager *blkmgr.BlockManager, payToAddress types.Address, parents []*hash.Hash, powType pow.PowType) (*types.BlockTemplate, error) {
 	subsidyCache := blockManager.GetChain().FetchSubsidyCache()
-
+	bd := blockManager.GetChain().BlockDAG()
 	best := blockManager.GetChain().BestSnapshot()
 	nextBlockHeight := uint64(0)
 	nextBlockOrder := uint64(best.GraphState.GetTotal())
@@ -108,37 +108,30 @@ func NewBlockTemplate(policy *Policy, params *params.Params,
 		return nil, err
 	}
 
-	parentsSet := blockdag.NewHashSet()
+	var mainp blockdag.IBlock
 	if parents == nil {
-		parents = blockManager.GetChain().GetMiningTips()
-		parentsSet.AddList(parents)
-		nextBlockHeight = uint64(blockManager.GetChain().BlockDAG().GetMainChainTip().GetHeight() + 1)
+		mainp = bd.GetMainChainTip()
 	} else {
-		parentsSet.AddList(parents)
-		mainp := blockManager.GetChain().BlockDAG().GetMainParent(blockManager.GetChain().BlockDAG().GetIdSet(parents))
-		nextBlockHeight = uint64(mainp.GetHeight() + 1)
+		mainp, parents = bd.GetMainParentAndList(parents)
 	}
 
-	coinbaseScript, err := standardCoinbaseScript(nextBlockHeight, extraNonce)
-	if err != nil {
-		return nil, err
-	}
-	opReturnPkScript, err := standardCoinbaseOpReturn([]byte{})
+	nextBlockHeight = uint64(mainp.GetHeight() + 1)
+
+	coinbaseScript, err := standardCoinbaseScript(nextBlockHeight, extraNonce, policy.CoinbaseGenerator.BuildExtraData(int64(nextBlockHeight)))
 	if err != nil {
 		return nil, err
 	}
 
-	blues := int64(blockManager.GetChain().BlockDAG().GetBlues(blockManager.GetChain().BlockDAG().GetIdSet(parents)))
-	coinbaseTx, err := createCoinbaseTx(subsidyCache,
+	blues := int64(bd.GetBluesByBlock(mainp))
+	coinbaseTx, taxOutput, oprOutput, err := createCoinbaseTx(subsidyCache,
 		coinbaseScript,
-		opReturnPkScript,
-		blues,
+		bd.GetBlueInfo(mainp),
 		payToAddress,
-		params)
+		params,
+		nil)
 	if err != nil {
 		return nil, err
 	}
-
 	coinbaseSigOpCost := int64(blockchain.CountSigOps(coinbaseTx))
 	// Get the current source transactions and create a priority queue to
 	// hold the transactions which are ready for inclusion into a block
@@ -156,7 +149,12 @@ func NewBlockTemplate(policy *Policy, params *params.Params,
 	blockTxns := make([]*types.Tx, 0, len(sourceTxns))
 	blockTxns = append(blockTxns, coinbaseTx)
 	blockUtxos := blockchain.NewUtxoViewpoint()
-	blockUtxos.SetViewpoints(parents)
+	if parents == nil {
+		blockUtxos.SetViewpoints(blockManager.GetChain().GetMiningTips(len(blockTxns)))
+	} else {
+		blockUtxos.SetViewpoints(parents)
+	}
+
 	// dependers is used to track transactions which depend on another
 	// transaction in the source pool.  This, in conjunction with the
 	// dependsOn map kept with each dependent transaction helps quickly
@@ -174,14 +172,27 @@ func NewBlockTemplate(policy *Policy, params *params.Params,
 	txFees = append(txFees, -1) // Updated once known
 	txSigOpCosts = append(txSigOpCosts, coinbaseSigOpCost)
 
+	tokenSigOpCost := int64(0)
+	tokenSize := uint32(0)
+
 	log.Debug("Inclusion to new block", "transactions", len(sourceTxns))
-mempoolLoop:
+
 	for _, txDesc := range sourceTxns {
 		// A block can't have more than one coinbase or contain
 		// non-finalized transactions.
 		tx := txDesc.Tx
 		if tx.Tx.IsCoinBase() {
 			log.Trace(fmt.Sprintf("Skipping coinbase tx %s", tx.Hash()))
+			continue
+		}
+		if types.IsTokenTx(tx.Tx) {
+			log.Trace(fmt.Sprintf("Skipping token tx %s", tx.Hash()))
+			blockTxns = append(blockTxns, tx)
+			txFees = append(txFees, 0)
+			tokenSOC := int64(blockchain.CountSigOps(tx))
+			txSigOpCosts = append(txSigOpCosts, tokenSOC)
+			tokenSigOpCost += tokenSOC
+			tokenSize += uint32(tx.Transaction().SerializeSize())
 			continue
 		}
 		if !blockchain.IsFinalizedTransaction(tx, nextBlockHeight,
@@ -191,92 +202,102 @@ mempoolLoop:
 			continue
 		}
 
-		// Fetch all of the utxos referenced by the this transaction.
-		// NOTE: This intentionally does not fetch inputs from the
-		// mempool since a transaction which depends on other
-		// transactions in the mempool must come after those
-		// dependencies in the final generated block.
-		utxos, err := blockManager.GetChain().FetchUtxoView(tx)
-		if err != nil {
-			log.Warn(fmt.Sprintf("Unable to fetch utxo view for tx %s: %v",
-				tx.Hash(), err))
-			continue
-		}
-
 		// Setup dependencies for any transactions which reference
 		// other transactions in the mempool so they can be properly
 		// ordered below.
 		weirandItem := &WeightedRandTx{tx: tx}
-		for _, txIn := range tx.Tx.TxIn {
-			originHash := &txIn.PreviousOut.Hash
-			entry := utxos.LookupEntry(txIn.PreviousOut)
-			if entry == nil || entry.IsSpent() {
-				if !txSource.HaveTransaction(originHash) {
-					log.Trace(fmt.Sprintf("Skipping tx %s because it "+
-						"references unspent output %v "+
-						"which is not available",
-						tx.Hash(), txIn.PreviousOut))
-					continue mempoolLoop
-				}
-
-				// The transaction is referencing another
-				// transaction in the source pool, so setup an
-				// ordering dependency.
-				deps, exists := dependers[*originHash]
-				if !exists {
-					deps = make(map[hash.Hash]*WeightedRandTx)
-					dependers[*originHash] = deps
-				}
-				deps[*weirandItem.tx.Hash()] = weirandItem
-				if weirandItem.dependsOn == nil {
-					weirandItem.dependsOn = make(
-						map[hash.Hash]struct{})
-				}
-				weirandItem.dependsOn[*originHash] = struct{}{}
-
-				// Skip the check below. We already know the
-				// referenced transaction is available.
-				continue
-			}
-		}
-
-		// Calculate the final transaction priority using the input
-		// value age sum as well as the adjusted transaction size.  The
-		// formula is: sum(inputValue * inputAge) / adjustedTxSize
-		weirandItem.priority = mempool.CalcPriority(tx.Tx, utxos,
-			nextBlockHeight, blockManager.GetChain().BlockDAG())
-
-		// Calculate the fee in Satoshi/kB.
 		weirandItem.feePerKB = txDesc.FeePerKB
 		weirandItem.fee = txDesc.Fee
-
-		// Add the transaction to the priority queue to mark it ready
-		// for inclusion in the block unless it has dependencies.
-		if weirandItem.dependsOn == nil {
-			weightedRandQueue.Push(weirandItem)
-		}
-
-		// Merge the referenced outputs from the input transactions to
-		// this transaction into the block utxo view.  This allows the
-		// code below to avoid a second lookup.
-		mergeUtxoView(blockUtxos, utxos)
+		weightedRandQueue.Push(weirandItem)
 	}
-
 	log.Trace(fmt.Sprintf("Weighted random queue len %d, dependers len %d",
 		weightedRandQueue.Len(), len(dependers)))
 
-	blockSize := uint32(blockHeaderOverhead) + uint32(coinbaseTx.Transaction().SerializeSize())
+	blockSize := uint32(blockHeaderOverhead) + uint32(coinbaseTx.Transaction().SerializeSize()) + tokenSize
 
-	blockSigOpCost := coinbaseSigOpCost
+	// ==== fix parents size
+	expectParents := []*hash.Hash{}
+	if parents == nil {
+		expectParents = blockManager.GetChain().GetMiningTips(blockdag.MaxPriority)
+	}
+	blockSize += uint32(s.VarIntSerializeSize(uint64(len(expectParents))))
+	for i := 0; i < len(expectParents); i++ {
+		blockSize += hash.HashSize
+	}
+	// =====
+
+	blockSigOpCost := coinbaseSigOpCost + tokenSigOpCost
 	totalFees := int64(0)
+	blockFeesMap := types.AmountMap{}
+
+	fetchUtxo := map[string]struct{}{}
+
+	ctx, cancel := context.WithTimeout(context.Background(), params.TargetTimePerBlock/2)
+	defer cancel()
 
 	// Choose which transactions make it into the block.
+mempool:
 	for weightedRandQueue.Len() > 0 {
+		//
+		select {
+		case <-ctx.Done():
+			log.Info(fmt.Sprintf("NewBlockTemplate will timed out(%s), so we will return the result as soon as possible.", (params.TargetTimePerBlock / 2).String()))
+			break mempool
+		default:
+		}
 		// Grab the highest priority (or highest fee per kilobyte
 		// depending on the sort order) transaction.
 		weirandItem := weightedRandQueue.Pop()
 		tx := weirandItem.tx
 
+		//
+		_, ok := fetchUtxo[tx.Hash().String()]
+		if !ok {
+			fetchUtxo[tx.Hash().String()] = struct{}{}
+			utxos, err := blockManager.GetChain().FetchUtxoView(tx)
+			if err != nil {
+				log.Warn(fmt.Sprintf("Unable to fetch utxo view for tx %s: %v",
+					tx.Hash(), err))
+				continue
+			}
+
+			for _, txIn := range tx.Tx.TxIn {
+				originHash := &txIn.PreviousOut.Hash
+				entry := utxos.LookupEntry(txIn.PreviousOut)
+				if entry == nil || entry.IsSpent() {
+					if !txSource.HaveTransaction(originHash) {
+						log.Trace(fmt.Sprintf("Skipping tx %s because it "+
+							"references unspent output %v "+
+							"which is not available",
+							tx.Hash(), txIn.PreviousOut))
+						continue
+					}
+
+					// The transaction is referencing another
+					// transaction in the source pool, so setup an
+					// ordering dependency.
+					deps, exists := dependers[*originHash]
+					if !exists {
+						deps = make(map[hash.Hash]*WeightedRandTx)
+						dependers[*originHash] = deps
+					}
+					deps[*weirandItem.tx.Hash()] = weirandItem
+					if weirandItem.dependsOn == nil {
+						weirandItem.dependsOn = make(
+							map[hash.Hash]struct{})
+					}
+					weirandItem.dependsOn[*originHash] = struct{}{}
+
+					// Skip the check below. We already know the
+					// referenced transaction is available.
+					continue
+				}
+			}
+			// Merge the referenced outputs from the input transactions to
+			// this transaction into the block utxo view.  This allows the
+			// code below to avoid a second lookup.
+			mergeUtxoView(blockUtxos, utxos)
+		}
 		// Grab any transactions which depend on this one.
 		deps := dependers[*tx.Hash()]
 
@@ -289,7 +310,7 @@ mempoolLoop:
 				"size %v, cur num tx %v", tx.Hash(), txSize,
 				blockSize, len(blockTxns)))
 			logSkippedDeps(tx, deps)
-			continue
+			break
 		}
 
 		// Enforce maximum signature operation cost per block.  Also
@@ -300,7 +321,7 @@ mempoolLoop:
 			log.Trace(fmt.Sprintf("Skipping tx %s because it would "+
 				"exceed the maximum sigops per block", tx.Hash()))
 			logSkippedDeps(tx, deps)
-			continue
+			break
 		}
 
 		// Skip free transactions once the block is larger than the
@@ -319,7 +340,7 @@ mempoolLoop:
 
 		// Ensure the transaction inputs pass all of the necessary
 		// preconditions before allowing it to be added to the block.
-		_, err = blockManager.GetChain().CheckTransactionInputs(tx, blockUtxos)
+		txFeesMap, err := blockManager.GetChain().CheckTransactionInputs(tx, blockUtxos)
 		if err != nil {
 			log.Trace(fmt.Sprintf("Skipping tx %s due to error in "+
 				"CheckTransactionInputs: %v", tx.Hash(), err))
@@ -354,9 +375,17 @@ mempoolLoop:
 		totalFees += weirandItem.fee
 		txFees = append(txFees, weirandItem.fee)
 		txSigOpCosts = append(txSigOpCosts, int64(sigOpCost))
-
-		log.Trace(fmt.Sprintf("Adding tx %s (priority %.2f, feePerKB %.2d)",
-			weirandItem.tx.Hash(), weirandItem.priority, weirandItem.feePerKB))
+		lastBFMSize := len(blockFeesMap)
+		blockFeesMap.Add(txFeesMap)
+		addBFMSize := len(blockFeesMap) - lastBFMSize
+		if addBFMSize <= 0 {
+			addBFMSize = 0
+		}
+		if addBFMSize > 0 {
+			blockSigOpCost += int64(addBFMSize)
+		}
+		log.Trace(fmt.Sprintf("Adding tx %s (feePerKB %.2d)",
+			weirandItem.tx.Hash(), weirandItem.feePerKB))
 
 		// Add transactions which depend on this one (and also do not
 		// have any other unsatisified dependencies) to the priority
@@ -370,8 +399,11 @@ mempoolLoop:
 			}
 		}
 	}
-
-	//coinbaseTx.Tx.TxOut[0].Amount += uint64(totalFees)
+	// Fill outputs
+	err = fillOutputsToCoinBase(coinbaseTx, blockFeesMap, taxOutput, oprOutput)
+	if err != nil {
+		return nil, miningRuleError(ErrCreatingCoinbase, err.Error())
+	}
 	txFees[0] = -totalFees
 
 	// Fill witness
@@ -383,74 +415,32 @@ mempoolLoop:
 	ts := MedianAdjustedTime(blockManager.GetChain(), timeSource)
 
 	//
-	reqBlake2bDDifficulty, err := blockManager.GetChain().CalcNextRequiredDifficulty(ts, pow.BLAKE2BD)
-	if err != nil {
-		return nil, miningRuleError(ErrGettingDifficulty, err.Error())
-	}
-
-	//
-	reqX16rv3Difficulty, err := blockManager.GetChain().CalcNextRequiredDifficulty(ts, pow.X16RV3)
-	if err != nil {
-		return nil, miningRuleError(ErrGettingDifficulty, err.Error())
-	}
-
-	//
-	reqX8r16Difficulty, err := blockManager.GetChain().CalcNextRequiredDifficulty(ts, pow.X8R16)
-	if err != nil {
-		return nil, miningRuleError(ErrGettingDifficulty, err.Error())
-	}
-
-	//
-	keccak256Difficulty, err := blockManager.GetChain().CalcNextRequiredDifficulty(ts, pow.QITMEERKECCAK256)
-	if err != nil {
-		return nil, miningRuleError(ErrGettingDifficulty, err.Error())
-	}
-	reqCuckarooDifficulty, err := blockManager.GetChain().CalcNextRequiredDifficulty(ts, pow.CUCKAROO)
-	if err != nil {
-		return nil, miningRuleError(ErrGettingDifficulty, err.Error())
-	}
-	reqCuckaroomDifficulty, err := blockManager.GetChain().CalcNextRequiredDifficulty(ts, pow.CUCKAROOM)
-	if err != nil {
-		return nil, miningRuleError(ErrGettingDifficulty, err.Error())
-	}
-	reqCuckatooDifficulty, err := blockManager.GetChain().CalcNextRequiredDifficulty(ts, pow.CUCKATOO)
-
+	reqCompactDifficulty, err := blockManager.GetChain().CalcNextRequiredDifficulty(ts, powType)
 	if err != nil {
 		return nil, miningRuleError(ErrGettingDifficulty, err.Error())
 	}
 
 	// Choose the block version to generate based on the network.
-	blockVersion := BlockVersion(params.Net)
-
+	blockVersion, err := blockManager.GetChain().CalcNextBlockVersion()
+	if err != nil {
+		return nil, miningRuleError(ErrFailedToGetGeneration, err.Error())
+	}
 	// Create a new block ready to be solved.
 	merkles := merkle.BuildMerkleTreeStore(blockTxns, false)
 
+	if parents == nil {
+		parents = blockManager.GetChain().GetMiningTips(len(blockTxns))
+	}
+
 	paMerkles := merkle.BuildParentsMerkleTreeStore(parents)
 	var block types.Block
-	var reqDiff uint32
-	switch powType {
-	case pow.BLAKE2BD:
-		reqDiff = reqBlake2bDDifficulty
-	case pow.CUCKAROO:
-		reqDiff = reqCuckarooDifficulty
-	case pow.CUCKATOO:
-		reqDiff = reqCuckatooDifficulty
-	case pow.CUCKAROOM:
-		reqDiff = reqCuckaroomDifficulty
-	case pow.X16RV3:
-		reqDiff = reqX16rv3Difficulty
-	case pow.X8R16:
-		reqDiff = reqX8r16Difficulty
-	case pow.QITMEERKECCAK256:
-		reqDiff = keccak256Difficulty
-	}
 	block.Header = types.BlockHeader{
 		Version:    blockVersion,
 		ParentRoot: *paMerkles[len(paMerkles)-1],
 		TxRoot:     *merkles[len(merkles)-1],
-		StateRoot:  hash.Hash{}, //TODO, state root
+		StateRoot:  blockManager.GetChain().CalculateTokenStateRoot(blockTxns, parents),
 		Timestamp:  ts,
-		Difficulty: reqDiff,
+		Difficulty: reqCompactDifficulty,
 		Pow:        pow.GetInstance(powType, 0, []byte{}),
 		// Size declared below
 	}
@@ -464,7 +454,6 @@ mempoolLoop:
 			return nil, miningRuleError(ErrTransactionAppend, err.Error())
 		}
 	}
-
 	sblock := types.NewBlock(&block)
 	sblock.SetOrder(nextBlockOrder)
 	sblock.SetHeight(uint(nextBlockHeight))
@@ -482,26 +471,21 @@ mempoolLoop:
 		"signOp", blockSigOpCost,
 		"bytes", blockSize,
 		"target",
-		fmt.Sprintf("%064x", pow.CompactToBig(block.Header.Difficulty)))
+		fmt.Sprintf("%064x", pow.CompactToBig(block.Header.Difficulty)),
+		"timestamp", block.Header.Timestamp,
+		"parents root", block.Header.ParentRoot.String())
 
-	blockTemplate := &types.BlockTemplate{
+	return &types.BlockTemplate{
 		Block:           &block,
 		Fees:            txFees,
 		SigOpCounts:     txSigOpCosts,
 		Height:          nextBlockHeight,
 		Blues:           blues,
 		ValidPayAddress: payToAddress != nil,
-		PowDiffData: types.PowDiffStandard{
-			Blake2bDTarget:         reqBlake2bDDifficulty,
-			X16rv3DTarget:          reqX16rv3Difficulty,
-			X8r16DTarget:           reqX8r16Difficulty,
-			QitmeerKeccak256Target: keccak256Difficulty,
-			CuckarooBaseDiff:       pow.CompactToBig(reqCuckarooDifficulty).Uint64(),
-			CuckaroomBaseDiff:      pow.CompactToBig(reqCuckaroomDifficulty).Uint64(),
-			CuckatooBaseDiff:       pow.CompactToBig(reqCuckatooDifficulty).Uint64(),
-		},
-	}
-	return handleCreatedBlockTemplate(blockTemplate, blockManager)
+		Difficulty:      reqCompactDifficulty,
+		BlockFeesMap:    blockFeesMap,
+	}, nil
+
 }
 
 // UpdateBlockTime updates the timestamp in the header of the passed block to

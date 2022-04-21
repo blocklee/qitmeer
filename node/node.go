@@ -3,16 +3,17 @@ package node
 
 import (
 	"fmt"
+	"github.com/Qitmeer/qitmeer/common/roughtime"
 	"github.com/Qitmeer/qitmeer/common/util"
 	"github.com/Qitmeer/qitmeer/config"
+	"github.com/Qitmeer/qitmeer/core/event"
 	"github.com/Qitmeer/qitmeer/database"
-	"github.com/Qitmeer/qitmeer/p2p/peerserver"
+	"github.com/Qitmeer/qitmeer/p2p"
 	"github.com/Qitmeer/qitmeer/params"
 	"github.com/Qitmeer/qitmeer/rpc"
 	"reflect"
 	"sync"
 	"sync/atomic"
-	"time"
 )
 
 // Node works as a server container for all service can be registered.
@@ -34,7 +35,7 @@ type Node struct {
 	DB database.DB
 
 	// network server
-	peerServer *peerserver.PeerServer
+	peerServer *p2p.Service
 
 	// service layer
 	// Service constructors (in dependency order)
@@ -44,6 +45,9 @@ type Node struct {
 
 	// api server
 	rpcServer *rpc.RpcServer
+
+	// event system
+	events event.Feed
 }
 
 func NewNode(cfg *config.Config, database database.DB, chainParams *params.Params, shutdownRequestChannel chan struct{}) (*Node, error) {
@@ -55,14 +59,14 @@ func NewNode(cfg *config.Config, database database.DB, chainParams *params.Param
 		quit:   make(chan struct{}),
 	}
 
-	server, err := peerserver.NewPeerServer(cfg, chainParams)
+	server, err := p2p.NewService(cfg, &n.events, chainParams)
 	if err != nil {
 		return nil, err
 	}
 	n.peerServer = server
 
 	if !cfg.DisableRPC {
-		n.rpcServer, err = rpc.NewRPCServer(cfg)
+		n.rpcServer, err = rpc.NewRPCServer(cfg, &n.events)
 		if err != nil {
 			return nil, err
 		}
@@ -79,7 +83,10 @@ func (n *Node) Stop() error {
 	log.Info("Stopping Server")
 
 	// stop rpc server
-	n.rpcServer.Stop()
+	if n.rpcServer != nil {
+		n.rpcServer.Stop()
+	}
+
 	// stop p2p server
 	n.peerServer.Stop()
 
@@ -141,7 +148,7 @@ func (n *Node) Start() error {
 	// start service one by one
 	startedSvs := []reflect.Type{}
 	for kind, service := range services {
-		if err := service.Start(n.peerServer); err != nil {
+		if err := service.Start(); err != nil {
 			// stopping all started service if upon failure
 			for _, kind := range startedSvs {
 				services[kind].Stop()
@@ -171,7 +178,7 @@ func (n *Node) Start() error {
 
 	// Finished node start
 	// Server startup time. Used for the uptime command for uptime calculation.
-	n.startupTime = time.Now().Unix()
+	n.startupTime = roughtime.Now().Unix()
 	n.wg.Wrap(n.nodeEventHandler)
 
 	return nil

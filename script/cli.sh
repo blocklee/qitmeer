@@ -134,6 +134,21 @@ function get_mempool(){
   get_result "$data"
 }
 
+function get_mempool_count(){
+  local data='{"jsonrpc":"2.0","method":"getMempoolCount","params":[],"id":1}'
+  get_result "$data"
+}
+
+function save_mempool(){
+  local data='{"jsonrpc":"2.0","method":"saveMempool","params":[],"id":1}'
+  get_result "$data"
+}
+
+function miner_info(){
+  local data='{"jsonrpc":"2.0","method":"getMinerInfo","params":[],"id":1}'
+  get_result "$data"
+}
+
 # return block by hash
 #   func (s *PublicBlockChainAPI) GetBlockByHash(ctx context.Context, blockHash common.Hash, fullTx bool) (map[string]interface{}, error)
 function get_block_by_hash(){
@@ -201,14 +216,64 @@ function get_utxo() {
 function tx_sign(){
    local private_key=$1
    local raw_tx=$2
-   local data='{"jsonrpc":"2.0","method":"test_txSign","params":["'$private_key'","'$raw_tx'"],"id":1}'
+   local tokenPrivateKey=$3
+   local data='{"jsonrpc":"2.0","method":"test_txSign","params":["'$private_key'","'$raw_tx'","'$tokenPrivateKey'"],"id":1}'
    get_result "$data"
 }
 
 #
-function create_raw_tx(){
+function create_raw_tx() {
   local input=$1
   local data='{"jsonrpc":"2.0","method":"createRawTransaction","params":['$input'],"id":1}'
+  get_result "$data"
+}
+
+function create_raw_txv2() {
+  local input=$1
+  local data='{"jsonrpc":"2.0","method":"createRawTransactionV2","params":['$input'],"id":1}'
+  get_result "$data"
+}
+
+function create_token_raw_tx(){
+  local txtype=$1
+  local coinId=$2
+
+  local coinName=$3
+  local owners=$4
+  local uplimit=$5
+  local inputs=$6
+  local amounts=$7
+  local feeType=$8
+  local feeValue=$9
+
+  if [ "$coinName" == "" ]; then
+    coinName=""
+  fi
+
+  if [ "$owners" == "" ]; then
+    owners=""
+  fi
+
+  if [ "$uplimit" == "" ]; then
+    uplimit=0
+  fi
+
+  if [ "$inputs" == "" ]; then
+    inputs='[{"txid":"","vout":0}]'
+  fi
+
+  if [ "$amounts" == "" ]; then
+    amounts='{"":0}'
+  fi
+
+  if [ "$feeType" == "" ]; then
+    feeType=0
+  fi
+  if [ "$feeValue" == "" ]; then
+    feeValue=0
+  fi
+
+  local data='{"jsonrpc":"2.0","method":"createTokenRawTransaction","params":["'$txtype'",'$coinId',"'$coinName'","'$owners'",'$uplimit','$inputs','$amounts','$feeType','$feeValue'],"id":1}'
   get_result "$data"
 }
 
@@ -253,7 +318,11 @@ function is_on_mainchain(){
 
 function get_block_template(){
   local capabilities=$1
-  local data='{"jsonrpc":"2.0","method":"getBlockTemplate","params":[["'$capabilities'"]],"id":1}'
+  local powtype=$2
+  if [ "$powtype" == "" ]; then
+    powtype=6
+  fi
+  local data='{"jsonrpc":"2.0","method":"getBlockTemplate","params":[["'$capabilities'"],'$powtype'],"id":1}'
   get_result "$data"
 }
 
@@ -290,7 +359,18 @@ function get_node_info(){
 }
 
 function get_peer_info(){
-  local data='{"jsonrpc":"2.0","method":"getPeerInfo","params":[],"id":null}'
+  local verbose=$1
+  local network=$2
+  if [ "$verbose" == "" ]; then
+    verbose="false"
+  fi
+
+  local data='{"jsonrpc":"2.0","method":"getPeerInfo","params":['$verbose',"'$network'"],"id":null}'
+  get_result "$data"
+}
+
+function get_network_info(){
+  local data='{"jsonrpc":"2.0","method":"getNetworkInfo","params":[],"id":null}'
   get_result "$data"
 }
 
@@ -385,6 +465,43 @@ function get_fees(){
   get_result "$data"
 }
 
+function time_info(){
+  local block_hash=$1
+  local data='{"jsonrpc":"2.0","method":"getTimeInfo","id":1}'
+  get_result "$data"
+}
+
+function get_tokeninfo(){
+  local data='{"jsonrpc":"2.0","method":"getTokenInfo","params":[],"id":null}'
+  get_result "$data"
+}
+
+function submit_block() {
+  local input=$1
+  local data='{"jsonrpc":"2.0","method":"submitBlock","params":["'$input'"],"id":1}'
+  get_result "$data"
+}
+
+function get_remote_gbt() {
+  local powtype=$1
+    if [ "$powtype" == "" ]; then
+    powtype=8
+  fi
+  local data='{"jsonrpc":"2.0","method":"getRemoteGBT","params":['$powtype'],"id":1}'
+  get_result "$data"
+}
+
+function submit_block_header() {
+  local input=$1
+  local data='{"jsonrpc":"2.0","method":"submitBlockHeader","params":["'$input'"],"id":1}'
+  get_result "$data"
+}
+
+function get_subsidy(){
+  local data='{"jsonrpc":"2.0","method":"getSubsidy","params":[],"id":null}'
+  get_result "$data"
+}
+
 function get_result(){
   local proto="https"
   if [ $notls -eq 1 ]; then
@@ -448,6 +565,7 @@ function usage(){
   echo "chain  :"
   echo "  nodeinfo"
   echo "  peerinfo"
+  echo "  networkinfo"
   echo "  rpcinfo"
   echo "  rpcmax <max>"
   echo "  main  <hash>"
@@ -455,6 +573,8 @@ function usage(){
   echo "  banlist"
   echo "  removeban"
   echo "  loglevel [trace, debug, info, warn, error, critical]"
+  echo "  timeinfo"
+  echo "  subsidy"
   echo "block  :"
   echo "  block <order|hash>"
   echo "  blockid <id>"
@@ -470,11 +590,14 @@ function usage(){
   echo "  tips"
   echo "  coinbase <hash>"
   echo "  fees <hash>"
+  echo "  tokeninfo"
   echo "tx     :"
   echo "  tx <id>"
   echo "  txv2 <id>"
   echo "  txbyhash <hash>"
   echo "  createRawTx"
+  echo "  createRawTxV2"
+  echo "  createTokenRawTx"
   echo "  txSign <rawTx>"
   echo "  sendRawTx <signedRawTx>"
   echo "  getrawtxs <address>"
@@ -483,6 +606,13 @@ function usage(){
   echo "miner  :"
   echo "  template"
   echo "  generate <num>"
+  echo "  mempool"
+  echo "  mempool_count"
+  echo "  savemempool"
+  echo "  minerinfo"
+  echo "  submitblock"
+  echo "  submitblockheader"
+  echo "  remotegbt"
 }
 
 # -------------------
@@ -752,7 +882,7 @@ elif [ "$1" == "main" ]; then
 
 elif [ "$1" == "template" ]; then
     shift
-    get_block_template $1 | jq .
+    get_block_template $@ | jq .
 
 elif [ "$1" == "mainHeight" ]; then
     shift
@@ -774,13 +904,25 @@ elif [ "$1" == "fees" ]; then
   shift
   get_fees $@
 
+elif [ "$1" == "timeinfo" ]; then
+  shift
+  time_info $@
+
+elif [ "$1" == "subsidy" ]; then
+  shift
+  get_subsidy $@
+
 elif [ "$1" == "nodeinfo" ]; then
   shift
   get_node_info
 
 elif [ "$1" == "peerinfo" ]; then
   shift
-  get_peer_info
+  get_peer_info $@
+
+elif [ "$1" == "networkinfo" ]; then
+  shift
+  get_network_info $@
 
 elif [ "$1" == "rpcinfo" ]; then
   shift
@@ -805,7 +947,9 @@ elif [ "$1" == "iscurrent" ]; then
 elif [ "$1" == "tips" ]; then
   shift
   tips | jq .
-
+elif [ "$1" == "tokeninfo" ]; then
+  shift
+  get_tokeninfo | jq .
 elif [ "$1" == "coinbase" ]; then
   shift
   get_coinbase $@
@@ -830,6 +974,14 @@ elif [ "$1" == "createRawTx" ]; then
   shift
   create_raw_tx $@
 
+elif [ "$1" == "createRawTxV2" ]; then
+  shift
+  create_raw_txv2 $@
+
+elif [ "$1" == "createTokenRawTx" ]; then
+  shift
+  create_token_raw_tx $@
+
 elif [ "$1" == "decodeRawTx" ]; then
   shift
   decode_raw_tx $@
@@ -852,12 +1004,21 @@ elif [ "$1" == "mempool" ]; then
   shift
   get_mempool $@
 
+elif [ "$1" == "mempool_count" ]; then
+  shift
+  get_mempool_count $@
+
+elif [ "$1" == "savemempool" ]; then
+  shift
+  save_mempool $@
+
+elif [ "$1" == "minerinfo" ]; then
+  shift
+  miner_info $@
 
 elif [ "$1" == "txSign" ]; then
   shift
   tx_sign $@
-  echo $@
-
 
 ## UTXO
 elif [ "$1" == "getutxo" ]; then
@@ -1001,6 +1162,19 @@ elif [ "$1" == "to_hex" ]; then
 elif [ "$1" == "to_base64" ]; then
   shift
   to_base64 $1
+
+elif [ "$1" == "submitblock" ]; then
+  shift
+  submit_block $@
+
+elif [ "$1" == "submitblockheader" ]; then
+  shift
+  submit_block_header $@
+
+elif [ "$1" == "remotegbt" ]; then
+  shift
+  get_remote_gbt $@
+
 elif [ "$1" == "list_command" ]; then
   usage
 else

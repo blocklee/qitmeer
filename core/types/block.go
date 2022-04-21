@@ -4,7 +4,6 @@ package types
 
 import (
 	"bytes"
-	"encoding/binary"
 	"fmt"
 	"github.com/Qitmeer/qitmeer/common/hash"
 	s "github.com/Qitmeer/qitmeer/core/serialization"
@@ -16,37 +15,32 @@ import (
 
 // MaxBlockHeaderPayload is the maximum number of bytes a block header can be.
 // Version 4 bytes + ParentRoot 32 bytes + TxRoot 32 bytes + StateRoot 32 bytes + Difficulty 4 bytes + Timestamp 4 bytes
-// + nonce 4 bytes + powType 1 byte +  edges_bits 1 byte + 42circles 42*4 bytes
-//total 113 + 169 = 282
-//blake2bd only need 113 bytes
-//cuckoo need 282 bytes
-const MaxBlockHeaderPayload = 4 + (hash.HashSize * 3) + 4 + 4 + 4 + 1 + 1 + 42*4
+// + nonce 8 bytes + powType 1 byte +  edges_bits 1 byte + 42circles 42*4 bytes
+// total 117 + 169 = 286
+// hash pow only need 117 bytes
+// cuckoo need 286 bytes
+const MaxBlockHeaderPayload = 4 + (hash.HashSize * 3) + 4 + 4 + 8 + 1 + 1 + 42*4
 
 // MaxBlockPayload is the maximum bytes a block message can be in bytes.
 const MaxBlockPayload = 1048576 // 1024*1024 (1MB)
 
-// maxTxPerBlock is the maximum number of transactions that could
+// MaxTxPerBlock is the maximum number of transactions that could
 // possibly fit into a block.
-const maxTxPerBlock = (MaxBlockPayload / minTxPayload) + 1
+const MaxTxPerBlock = (MaxBlockPayload / minTxPayload) + 1
 
 //Limited parents quantity
 const MaxParentsPerBlock = 50
 
 // blockHeaderLen is a constant that represents the number of bytes for a block
-// header. common header need 113 bytes , proof data need extra 169 bytes
-const blockHeaderLen = 113 + 169
+// header. common header need 117 bytes , proof data need extra 169 bytes
+const blockHeaderLen = 117 + 169
 
 // MaxBlocksPerMsg is the maximum number of blocks allowed per message.
 const MaxBlocksPerMsg = 500
 
-//max version value .
-// because only has 2 bytes
-const MaxBlockVersionValue = 65535
-
 type BlockHeader struct {
 
 	// block version
-	// first 2 bytes, so this value can't more than 65535
 	Version uint32
 
 	// The merkle root of the previous parent blocks (the dag layer)
@@ -104,7 +98,7 @@ func (h *BlockHeader) BlockHash() hash.Hash {
 
 // BlockData computes the block data for block hash.
 // Block data has the dynamic length.
-//   - blake2bd data is 113 bytes .
+//   - blake2bd data is 117 bytes .
 //   - cuckoo data is 282 bytes .
 func (bh *BlockHeader) BlockData() []byte {
 	// Encode the header and hash256 everything prior to the number of
@@ -117,17 +111,6 @@ func (bh *BlockHeader) BlockData() []byte {
 	_ = s.WriteElements(buf, bh.Version, &bh.ParentRoot, &bh.TxRoot,
 		&bh.StateRoot, bh.Difficulty, sec, bh.Pow.BlockData())
 	return buf.Bytes()
-}
-
-//To maintain version
-//use the first 2 bytes for version
-//last 2 bytes use for rand nonce
-func (bh *BlockHeader) GetVersion() uint32 {
-	b := make([]byte, 4)
-	newVersionData := make([]byte, 4)
-	binary.LittleEndian.PutUint32(b, bh.Version)
-	copy(newVersionData[:2], b[:2])
-	return binary.LittleEndian.Uint32(newVersionData)
 }
 
 // readBlockHeader reads a block header from io reader.  See Deserialize for
@@ -368,9 +351,9 @@ func (b *Block) DeserializeTxLoc(r *bytes.Buffer) ([]TxLoc, error) {
 	// Prevent more transactions than could possibly fit into a block.
 	// It would be possible to cause memory exhaustion and panics without
 	// a sane upper bound on this count.
-	if txCount > maxTxPerBlock {
+	if txCount > MaxTxPerBlock {
 		return nil, fmt.Errorf("Block.DeserializeTxLoc: too many transactions to fit into a block "+
-			"[count %d, max %d]", txCount, maxTxPerBlock)
+			"[count %d, max %d]", txCount, MaxTxPerBlock)
 	}
 
 	// Deserialize each transaction while keeping track of its location
@@ -416,6 +399,13 @@ type SerializedBlock struct {
 	txnsGenerated   bool      // ALL wrapped transactions generated
 	order           uint64    //order is in the position of whole block chain.
 	height          uint      //height is in the sub dag chain.
+}
+
+// The stringer method makes SerializedBlock satisfy the Stringer interface.
+// It simplifies the message printing in the trace logs.
+func (sb *SerializedBlock) String() string {
+	return fmt.Sprintf("blockhash: %v transactions:%d txnsGenerated:%v order:%d height:%d",
+		sb.hash.String(), len(sb.transactions), sb.txnsGenerated, sb.order, sb.height)
 }
 
 // NewBlock returns a new instance of the serialized block given an underlying Block.

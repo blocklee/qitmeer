@@ -6,11 +6,12 @@ package common
 
 import (
 	"fmt"
+	"github.com/Qitmeer/qitmeer/common/roughtime"
 	"github.com/Qitmeer/qitmeer/common/util"
 	"github.com/Qitmeer/qitmeer/config"
 	"github.com/Qitmeer/qitmeer/core/address"
+	"github.com/Qitmeer/qitmeer/core/types"
 	"github.com/Qitmeer/qitmeer/log"
-	"github.com/Qitmeer/qitmeer/p2p/peer"
 	"github.com/Qitmeer/qitmeer/params"
 	"github.com/Qitmeer/qitmeer/services/mempool"
 	"github.com/Qitmeer/qitmeer/version"
@@ -19,7 +20,9 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
+	"time"
 )
 
 const (
@@ -31,13 +34,16 @@ const (
 	defaultLogFilename            = "qitmeer.log"
 	defaultGenerate               = false
 	defaultBlockMinSize           = 0
-	defaultBlockMaxSize           = 375000
+	defaultBlockMaxSize           = types.MaxBlockPayload / 2
 	defaultMaxRPCClients          = 10
-	defaultMaxPeers               = 125
+	defaultMaxRPCWebsockets       = 25
+	defaultMaxRPCConcurrentReqs   = 20
+	defaultMaxPeers               = 50
 	defaultMiningStateSync        = false
-	defaultMaxInboundPeersPerHost = 10 // The default max total of inbound peer for host
-	defaultTrickleInterval        = peer.TrickleTimeout
+	defaultMaxInboundPeersPerHost = 25 // The default max total of inbound peer for host
+	defaultTrickleInterval        = 10 * time.Second
 	defaultCacheInvalidTx         = false
+	defaultMempoolExpiry          = int64(time.Hour)
 )
 const (
 	defaultSigCacheMaxSize = 100000
@@ -63,28 +69,32 @@ func LoadConfig() (*config.Config, []string, error) {
 
 	// Default config.
 	cfg := config.Config{
-		HomeDir:           defaultHomeDir,
-		ConfigFile:        defaultConfigFile,
-		DebugLevel:        defaultLogLevel,
-		DebugPrintOrigins: defaultDebugPrintOrigins,
-		DataDir:           defaultDataDir,
-		LogDir:            defaultLogDir,
-		DbType:            defaultDbType,
-		RPCKey:            defaultRPCKeyFile,
-		RPCCert:           defaultRPCCertFile,
-		RPCMaxClients:     defaultMaxRPCClients,
-		Generate:          defaultGenerate,
-		MaxPeers:          defaultMaxPeers,
-		MinTxFee:          mempool.DefaultMinRelayTxFee,
-		BlockMinSize:      defaultBlockMinSize,
-		BlockMaxSize:      defaultBlockMaxSize,
-		SigCacheMaxSize:   defaultSigCacheMaxSize,
-		MiningStateSync:   defaultMiningStateSync,
-		DAGType:           defaultDAGType,
-		Banning:           false,
-		MaxInbound:        defaultMaxInboundPeersPerHost,
-		TrickleInterval:   defaultTrickleInterval,
-		CacheInvalidTx:    defaultCacheInvalidTx,
+		HomeDir:              defaultHomeDir,
+		ConfigFile:           defaultConfigFile,
+		DebugLevel:           defaultLogLevel,
+		DebugPrintOrigins:    defaultDebugPrintOrigins,
+		DataDir:              defaultDataDir,
+		LogDir:               defaultLogDir,
+		DbType:               defaultDbType,
+		RPCKey:               defaultRPCKeyFile,
+		RPCCert:              defaultRPCCertFile,
+		RPCMaxClients:        defaultMaxRPCClients,
+		RPCMaxWebsockets:     defaultMaxRPCWebsockets,
+		RPCMaxConcurrentReqs: defaultMaxRPCConcurrentReqs,
+		Generate:             defaultGenerate,
+		MaxPeers:             defaultMaxPeers,
+		MinTxFee:             mempool.DefaultMinRelayTxFee,
+		BlockMinSize:         defaultBlockMinSize,
+		BlockMaxSize:         defaultBlockMaxSize,
+		SigCacheMaxSize:      defaultSigCacheMaxSize,
+		MiningStateSync:      defaultMiningStateSync,
+		DAGType:              defaultDAGType,
+		Banning:              true,
+		MaxInbound:           defaultMaxInboundPeersPerHost,
+		CacheInvalidTx:       defaultCacheInvalidTx,
+		NTP:                  false,
+		MempoolExpiry:        defaultMempoolExpiry,
+		AcceptNonStd:         true,
 	}
 
 	// Pre-parse the command line options to see if an alternative config
@@ -214,7 +224,6 @@ func LoadConfig() (*config.Config, []string, error) {
 		numNets++
 		// Also disable dns seeding on the private test network.
 		params.ActiveNetParams = &params.PrivNetParam
-		cfg.DisableDNSSeed = true
 	}
 	if cfg.MixNet {
 		numNets++
@@ -230,25 +239,61 @@ func LoadConfig() (*config.Config, []string, error) {
 		return nil, nil, err
 	}
 
-	if err := params.ActiveNetParams.PowConfig.Check(); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return nil, nil, err
-	}
-
-	// seed
-	processCustomizedDNSSeed(params.ActiveNetParams.Params, cfg.CustomDNSSeed)
-
 	// default p2p port
 	if len(cfg.DefaultPort) > 0 {
 		params.ActiveNetParams.Params.DefaultPort = cfg.DefaultPort
 	}
 
-	// Add the default listener if none were specified. The default
-	// listener is all addresses on the listen port for the network
-	// we are to connect to.
-	if len(cfg.Listeners) == 0 {
-		cfg.Listeners = []string{
-			net.JoinHostPort("", params.ActiveNetParams.DefaultPort),
+	if cfg.P2PTCPPort <= 0 {
+		P2PTCPPort, err := strconv.Atoi(params.ActiveNetParams.DefaultPort)
+		if err != nil {
+			return nil, nil, err
+		}
+		cfg.P2PTCPPort = P2PTCPPort
+	}
+
+	if cfg.P2PUDPPort <= 0 {
+		cfg.P2PUDPPort = params.ActiveNetParams.DefaultUDPPort
+	}
+	//
+	if err := params.ActiveNetParams.PowConfig.Check(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return nil, nil, err
+	}
+
+	// Add default port to all rpc listener addresses if needed and remove
+	// duplicate addresses.
+	cfg.RPCListeners = normalizeAddresses(cfg.RPCListeners,
+		params.ActiveNetParams.RpcPort)
+
+	// Only allow TLS to be disabled if the RPC is bound to localhost
+	// addresses.
+	if !cfg.DisableRPC && cfg.DisableTLS {
+		allowedTLSListeners := map[string]struct{}{
+			"localhost": {},
+			"127.0.0.1": {},
+			"0.0.0.0":   {},
+			"::1":       {},
+		}
+		for _, addr := range cfg.RPCListeners {
+			host, _, err := net.SplitHostPort(addr)
+			if err != nil {
+				str := "%s: RPC listen interface '%s' is " +
+					"invalid: %v"
+				err := fmt.Errorf(str, funcName, addr, err)
+				fmt.Fprintln(os.Stderr, err)
+				fmt.Fprintln(os.Stderr, usageMessage)
+				return nil, nil, err
+			}
+			if _, ok := allowedTLSListeners[host]; !ok {
+				str := "%s: the --notls option may not be used " +
+					"when binding RPC to non localhost " +
+					"addresses: %s"
+				err := fmt.Errorf(str, funcName, addr)
+				fmt.Fprintln(os.Stderr, err)
+				fmt.Fprintln(os.Stderr, usageMessage)
+				return nil, nil, err
+			}
 		}
 	}
 
@@ -263,6 +308,15 @@ func LoadConfig() (*config.Config, []string, error) {
 			addr = net.JoinHostPort(addr, params.ActiveNetParams.RpcPort)
 			cfg.RPCListeners = append(cfg.RPCListeners, addr)
 		}
+	}
+
+	if cfg.RPCMaxConcurrentReqs < 0 {
+		str := "%s: The rpcmaxwebsocketconcurrentrequests option may " +
+			"not be less than 0 -- parsed [%d]"
+		err := fmt.Errorf(str, funcName, cfg.RPCMaxConcurrentReqs)
+		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(os.Stderr, usageMessage)
+		return nil, nil, err
 	}
 
 	// Append the network type to the data directory so it is "namespaced"
@@ -283,7 +337,7 @@ func LoadConfig() (*config.Config, []string, error) {
 
 		// Initialize log rotation.  After log rotation has been initialized, the
 		// logger variables may be used.
-		InitLogRotator(filepath.Join(cfg.LogDir, defaultLogFilename))
+		log.InitLogRotator(filepath.Join(cfg.LogDir, defaultLogFilename))
 	}
 
 	// Parse, validate, and set debug log level(s).
@@ -343,45 +397,27 @@ func LoadConfig() (*config.Config, []string, error) {
 		cfg.SetMiningAddrs(addr)
 	}
 
-	// Validate any given whitelisted IP addresses and networks.
-	if len(cfg.Whitelists) > 0 {
-		var ip net.IP
-		for _, addr := range cfg.Whitelists {
-			_, ipnet, err := net.ParseCIDR(addr)
-			if err != nil {
-				ip = net.ParseIP(addr)
-				if ip == nil {
-					str := "%s: the whitelist value of '%s' is invalid"
-					err = fmt.Errorf(str, funcName, addr)
-					fmt.Fprintln(os.Stderr, err)
-					fmt.Fprintln(os.Stderr, usageMessage)
-					return nil, nil, err
-				}
-				var bits int
-				if ip.To4() == nil {
-					// IPv6
-					bits = 128
-				} else {
-					bits = 32
-				}
-				ipnet = &net.IPNet{
-					IP:   ip,
-					Mask: net.CIDRMask(bits, bits),
-				}
-			}
-			cfg.AddToWhitelists(ipnet)
+	if cfg.Generate {
+		cfg.Miner = true
+	}
+	// Ensure there is at least one mining address when the generate or miner flag is
+	// set.
+	if len(cfg.MiningAddrs) == 0 {
+		var str string
+		if cfg.Generate {
+			str = "%s: the generate flag is set, but there are no mining " +
+				"addresses specified "
+		}
+		if len(str) > 0 {
+			err := fmt.Errorf(str, funcName)
+			fmt.Fprintln(os.Stderr, err)
+			fmt.Fprintln(os.Stderr, usageMessage)
+			return nil, nil, err
 		}
 	}
 
-	// Ensure there is at least one mining address when the generate flag is
-	// set.
-	if cfg.Generate && len(cfg.MiningAddrs) == 0 {
-		str := "%s: the generate flag is set, but there are no mining " +
-			"addresses specified "
-		err := fmt.Errorf(str, funcName)
-		fmt.Fprintln(os.Stderr, err)
-		fmt.Fprintln(os.Stderr, usageMessage)
-		return nil, nil, err
+	if cfg.NTP {
+		roughtime.Init()
 	}
 
 	// Warn about missing config file only after all other configuration is
@@ -415,20 +451,43 @@ func ParseAndSetDebugLevels(debugLevel string) error {
 			return fmt.Errorf(str, debugLevel)
 		}
 		// Change the logging level for all subsystems.
-		Glogger().Verbosity(lvl)
+		log.Glogger().Verbosity(lvl)
 		return nil
 	}
 	// TODO support log for subsystem
 	return nil
 }
 
-func processCustomizedDNSSeed(param *params.Params, seed []string) {
-	if len(seed) == 0 {
-		return
+// normalizeAddress returns addr with the passed default port appended if
+// there is not already a port specified.
+func normalizeAddress(addr, defaultPort string) string {
+	_, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return net.JoinHostPort(addr, defaultPort)
 	}
-	dnsseed := []params.DNSSeed{}
-	for _, v := range seed {
-		dnsseed = append(dnsseed, params.DNSSeed{Host: v, HasFiltering: true})
+	return addr
+}
+
+// normalizeAddresses returns a new slice with all the passed peer addresses
+// normalized with the given default port, and all duplicates removed.
+func normalizeAddresses(addrs []string, defaultPort string) []string {
+	for i, addr := range addrs {
+		addrs[i] = normalizeAddress(addr, defaultPort)
 	}
-	param.DNSSeeds = dnsseed
+
+	return removeDuplicateAddresses(addrs)
+}
+
+// removeDuplicateAddresses returns a new slice with all duplicate entries in
+// addrs removed.
+func removeDuplicateAddresses(addrs []string) []string {
+	result := make([]string, 0, len(addrs))
+	seen := map[string]struct{}{}
+	for _, val := range addrs {
+		if _, ok := seen[val]; !ok {
+			result = append(result, val)
+			seen[val] = struct{}{}
+		}
+	}
+	return result
 }

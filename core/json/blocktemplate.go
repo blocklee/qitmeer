@@ -1,22 +1,8 @@
 package json
 
-// for miner template
 type PowDiffReference struct {
-	//blake2bd diff
-	Blake2bDBits string `json:"blake2bd_bits"`
-	//blake2bd hash diff compare target
-	Blake2bTarget          string `json:"blake2bd_target"`
-	X16rv3Bits             string `json:"x_16_rv_3_bits"`
-	X16rv3Target           string `json:"x_16_rv_3_target"`
-	X8r16Bits              string `json:"x8r16_bits"`
-	X8r16Target            string `json:"x8r16_target"`
-	QitmeerKeccak256Bits   string `json:"qitmeer_keccak256_bits"`
-	QitmeerKeccak256Target string `json:"qitmeer_keccak256_target"`
-
-	//cuckoo mining min diff
-	CuckarooMinDiff  uint64 `json:"cuckaroo_min_diff,omitempty"`
-	CuckaroomMinDiff uint64 `json:"cuckaroom_min_diff,omitempty"`
-	CuckatooMinDiff  uint64 `json:"cuckatoo_min_diff,omitempty"`
+	NBits  string `json:"nbits"`
+	Target string `json:"target"`
 }
 
 //LL(getblocktemplate RPC) 2018-10-28
@@ -25,6 +11,7 @@ type PowDiffReference struct {
 //// argument to GetBlockTemplate RPC.
 type TemplateRequest struct {
 	Mode         string   `json:"mode,omitempty"`
+	PowType      byte     `json:"pow_type"`
 	Capabilities []string `json:"capabilities,omitempty"`
 
 	// Optional long polling.
@@ -88,6 +75,7 @@ type GetBlockTemplateResult struct {
 	CoinbaseTxn   *GetBlockTemplateResultTx  `json:"coinbasetxn,omitempty"`
 	CoinbaseValue *uint64                    `json:"coinbasevalue,omitempty"`
 	WorkID        string                     `json:"workid,omitempty"`
+	NodeInfo      string                     `json:"nodeinfo,omitempty"`
 
 	// Witness commitment defined in BIP 0141.
 	DefaultWitnessCommitment string `json:"default_witness_commitment,omitempty"`
@@ -107,6 +95,23 @@ type GetBlockTemplateResult struct {
 	NonceRange string   `json:"noncerange,omitempty"`
 
 	// Block proposal from BIP 0023.
-	Capabilities  []string `json:"capabilities,omitempty"`
-	RejectReasion string   `json:"reject-reason,omitempty"`
+	// temp use
+	WorkData        string        `json:"workdata"`
+	Capabilities    []string      `json:"capabilities,omitempty"`
+	RejectReasion   string        `json:"reject-reason,omitempty"`
+	BlockFeesMap    map[int]int64 `json:"block_fees_map"`
+	CoinbaseVersion string        `json:"coinbase_version"`
+}
+
+type MinerInfoResult struct {
+	Type          string `json:"type"`
+	Pow           string `json:"pow"`
+	Running       bool   `json:"running"`
+	Coinbase      string `json:"coinbase"`
+	Height        uint64 `json:"height"`
+	Difficulty    string `json:"difficulty"`
+	Target        string `json:"target"`
+	Timestamp     string `json:"timestamp"`
+	TotalSubmit   int    `json:"totalsubmit"`
+	SuccessSubmit int    `json:"successsubmit"`
 }

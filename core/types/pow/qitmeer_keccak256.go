@@ -32,7 +32,6 @@ func (this *QitmeerKeccak256) Verify(headerData []byte, blockHash hash.Hash, tar
 			"low", target)
 		return errors.New(str)
 	}
-
 	//The target difficulty must be less than the maximum allowed.
 	if target.Cmp(this.params.QitmeerKeccak256PowLimit) > 0 {
 		str := fmt.Sprintf("block target difficulty of %064x is "+
@@ -65,12 +64,6 @@ func (this *QitmeerKeccak256) GetNextDiffBig(weightedSumDiv *big.Int, oldDiffBig
 	return nextDiffBig
 }
 
-func (this *QitmeerKeccak256) PowPercent() *big.Int {
-	targetPercent := big.NewInt(int64(this.params.GetPercentByHeight(this.mainHeight).QitmeerKeccak256Percent))
-	targetPercent.Lsh(targetPercent, 32)
-	return targetPercent
-}
-
 func (this *QitmeerKeccak256) GetSafeDiff(cur_reduce_diff uint64) *big.Int {
 	limitBits := this.params.QitmeerKeccak256PowLimitBits
 	limitBitsBig := CompactToBig(limitBits)
@@ -95,15 +88,12 @@ func (this *QitmeerKeccak256) CompareDiff(newTarget *big.Int, target *big.Int) b
 // pow proof data
 func (this *QitmeerKeccak256) Bytes() PowBytes {
 	r := make(PowBytes, 0)
-	//write nonce 4 bytes
-	n := make([]byte, 4)
-	binary.LittleEndian.PutUint32(n, this.Nonce)
+	// write pow type 1 byte
+	r = append(r, []byte{byte(this.PowType)}...)
+	// write nonce 8 bytes
+	n := make([]byte, 8)
+	binary.LittleEndian.PutUint64(n, this.Nonce)
 	r = append(r, n...)
-
-	t := make([]byte, 1)
-	//write pow type 1 byte
-	t[0] = uint8(this.PowType)
-	r = append(r, t...)
 	//write ProofData 169 bytes
 	r = append(r, this.ProofData[:]...)
 	return PowBytes(r)
@@ -115,7 +105,10 @@ func (this *QitmeerKeccak256) BlockData() PowBytes {
 	return PowBytes(this.Bytes()[:l-PROOFDATA_LENGTH])
 }
 
-//check pow is available
-func (this *QitmeerKeccak256) CheckAvailable() bool {
-	return this.params.GetPercentByHeight(this.mainHeight).QitmeerKeccak256Percent > 0
+//not support
+func (this *QitmeerKeccak256) FindSolver(headerData []byte, blockHash hash.Hash, targetDiffBits uint32) bool {
+	if err := this.Verify(headerData, blockHash, targetDiffBits); err == nil {
+		return true
+	}
+	return false
 }

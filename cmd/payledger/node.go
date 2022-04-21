@@ -7,9 +7,7 @@ import (
 	"github.com/Qitmeer/qitmeer/database"
 	"github.com/Qitmeer/qitmeer/log"
 	"github.com/Qitmeer/qitmeer/params"
-	"github.com/Qitmeer/qitmeer/services/common"
 	"github.com/Qitmeer/qitmeer/services/index"
-	"github.com/Qitmeer/qitmeer/services/mining"
 	"os"
 	"path"
 )
@@ -50,7 +48,6 @@ func (node *Node) init(cfg *Config, srcnode *SrcNode, endPoint blockdag.IBlock) 
 		ChainParams:  params.ActiveNetParams.Params,
 		TimeSource:   blockchain.NewMedianTime(),
 		DAGType:      cfg.DAGType,
-		BlockVersion: mining.BlockVersion(params.ActiveNetParams.Params.Net),
 		IndexManager: indexManager,
 	})
 	if err != nil {
@@ -91,7 +88,7 @@ func (node *Node) processBlockDAG(srcnode *SrcNode) error {
 		return nil
 	}
 
-	common.Glogger().Verbosity(log.LvlCrit)
+	log.Glogger().Verbosity(log.LvlCrit)
 	var bar *ProgressBar
 	i := uint(1)
 	if !node.cfg.DisableBar {
@@ -105,7 +102,7 @@ func (node *Node) processBlockDAG(srcnode *SrcNode) error {
 	}
 
 	defer func() {
-		common.Glogger().Verbosity(log.LvlInfo)
+		log.Glogger().Verbosity(log.LvlInfo)
 		if bar != nil {
 			fmt.Println()
 		}
@@ -123,7 +120,7 @@ func (node *Node) processBlockDAG(srcnode *SrcNode) error {
 			return err
 		}
 		//fmt.Printf("%d %s\n", i, blockHash.String())
-		err = node.bc.FastAcceptBlock(block)
+		err = node.bc.FastAcceptBlock(block, blockchain.BFFastAdd)
 		if err != nil {
 			return err
 		}

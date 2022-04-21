@@ -1,16 +1,18 @@
 package notifymgr
 
 import (
-	"github.com/Qitmeer/qitmeer/core/message"
+	"fmt"
 	"github.com/Qitmeer/qitmeer/core/types"
-	"github.com/Qitmeer/qitmeer/p2p/peerserver"
+	"github.com/Qitmeer/qitmeer/log"
+	"github.com/Qitmeer/qitmeer/p2p"
 	"github.com/Qitmeer/qitmeer/rpc"
+	"github.com/libp2p/go-libp2p-core/peer"
 )
 
 // NotifyMgr manage message announce & relay & notification between mempool, websocket, gbt long pull
 // and rpc server.
 type NotifyMgr struct {
-	Server    *peerserver.PeerServer
+	Server    *p2p.Service
 	RpcServer *rpc.RpcServer
 }
 
@@ -18,35 +20,41 @@ type NotifyMgr struct {
 // both websocket and getblocktemplate long poll clients of the passed
 // transactions.  This function should be called whenever new transactions
 // are added to the mempool.
-func (ntmgr *NotifyMgr) AnnounceNewTransactions(newTxs []*types.TxDesc) {
-	// Generate and relay inventory vectors for all newly accepted
-	// transactions into the memory pool due to the original being
-	// accepted.
+func (ntmgr *NotifyMgr) AnnounceNewTransactions(newTxs []*types.TxDesc, filters []peer.ID) {
+	if len(newTxs) <= 0 {
+		return
+	}
 	for _, tx := range newTxs {
-		// Generate the inventory vector and relay it.
-		iv := message.NewInvVect(message.InvTypeTx, tx.Tx.Hash())
-		// reply to p2p
-		ntmgr.RelayInventory(iv, tx)
-		// reply to rpc
-		if ntmgr.RpcServer != nil {
-			//TODO reply to rpc layer (if websockect long connection or gbt long poll)
-			// Notify websocket clients about mempool transactions.
-			//qitmeer.node.rpcServer.ntfnMgr.NotifyMempoolTx(tx, true)
-			//
-			// Potentially notify any getblocktemplate long poll clients
-			// about stale block templates due to the new transaction.
-			//qitmeer.node.rpcServer.gbtWorkState.NotifyMempoolTx(
-			//	qitmeer.txMemPool.LastUpdated())
-		}
+		log.Trace(fmt.Sprintf("Announce new transaction :hash=%s height=%d add=%s", tx.Tx.Hash().String(), tx.Height, tx.Added.String()))
+	}
+	// reply to p2p
+	for _, tx := range newTxs {
+		ntmgr.RelayInventory(tx, filters)
+	}
+
+	if ntmgr.RpcServer != nil {
+		ntmgr.RpcServer.NotifyNewTransactions(newTxs)
 	}
 }
 
 // RelayInventory relays the passed inventory vector to all connected peers
 // that are not already known to have it.
-func (ntmgr *NotifyMgr) RelayInventory(invVect *message.InvVect, data interface{}) {
-	ntmgr.Server.RelayInventory(invVect, data)
+func (ntmgr *NotifyMgr) RelayInventory(data interface{}, filters []peer.ID) {
+	ntmgr.Server.RelayInventory(data, filters)
 }
 
-func (ntmgr *NotifyMgr) BroadcastMessage(msg message.Message) {
-	ntmgr.Server.BroadcastMessage(msg)
+func (ntmgr *NotifyMgr) BroadcastMessage(data interface{}) {
+	ntmgr.Server.BroadcastMessage(data)
+}
+
+func (ntmgr *NotifyMgr) AddRebroadcastInventory(newTxs []*types.TxDesc) {
+	for _, tx := range newTxs {
+		ntmgr.Server.Rebroadcast().AddInventory(tx.Tx.Hash(), tx)
+	}
+}
+
+// Transaction has one confirmation on the main chain. Now we can mark it as no
+// longer needing rebroadcasting.
+func (ntmgr *NotifyMgr) TransactionConfirmed(tx *types.Tx) {
+	ntmgr.Server.Rebroadcast().RemoveInventory(tx.Hash())
 }

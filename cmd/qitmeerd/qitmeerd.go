@@ -6,7 +6,7 @@ package main
 
 import (
 	"fmt"
-	"github.com/Qitmeer/qitmeer/core/message"
+	"github.com/Qitmeer/qitmeer/config"
 	_ "github.com/Qitmeer/qitmeer/database/ffldb"
 	"github.com/Qitmeer/qitmeer/log"
 	"github.com/Qitmeer/qitmeer/node"
@@ -31,6 +31,7 @@ func main() {
 
 	// Work around defer not working after os.Exit()
 	if err := qitmeerdMain(nil); err != nil {
+		log.Error(err.Error())
 		os.Exit(1)
 	}
 }
@@ -49,8 +50,8 @@ func qitmeerdMain(nodeChan chan<- *node.Node) error {
 	}
 
 	defer func() {
-		if common.LogWrite() != nil {
-			common.LogWrite().Close()
+		if log.LogWrite() != nil {
+			log.LogWrite().Close()
 		}
 	}()
 	// Get a channel that will be closed when a shutdown signal has been
@@ -61,7 +62,6 @@ func qitmeerdMain(nodeChan chan<- *node.Node) error {
 
 	// Show version and home dir at startup.
 	log.Info("System info", "Qitmeer Version", version.String(), "Go version", runtime.Version())
-	log.Info("System info", "UUID", message.UUID)
 	log.Info("System info", "Home dir", cfg.HomeDir)
 
 	if cfg.NoFileLogging {
@@ -112,7 +112,7 @@ func qitmeerdMain(nodeChan chan<- *node.Node) error {
 	// Create node and start it.
 	n, err := node.NewNode(cfg, db, params.ActiveNetParams.Params, shutdownRequestChannel)
 	if err != nil {
-		log.Error("Unable to start server", "listeners", cfg.Listeners, "error", err)
+		log.Error("Unable to start server", "listeners", cfg.Listener, "error", err)
 		return err
 	}
 	err = n.RegisterService()
@@ -132,7 +132,8 @@ func qitmeerdMain(nodeChan chan<- *node.Node) error {
 		log.Error("Uable to start server", "error", err)
 		return err
 	}
-
+	showLogo(cfg)
+	//
 	if nodeChan != nil {
 		nodeChan <- n
 	}
@@ -141,4 +142,20 @@ func qitmeerdMain(nodeChan chan<- *node.Node) error {
 	// server.
 	<-interrupt
 	return nil
+}
+
+func showLogo(cfg *config.Config) {
+	logo := `
+
+         .__  __                                                                    
+    _____|__|/  |_  _____   ____   ___________    Qitmeer %s
+   / ____/  \   __\/     \_/ __ \_/ __ \_  __ \   Port: %d
+  < <_|  |  ||  | |  Y Y  \  ___/\  ___/|  | \/   PID : %d
+   \__   |__||__| |__|_|  /\___  >\___  >__|      Network : %s                      
+      |__|              \/     \/     \/          https://github.com/Qitmeer/qitmeer
+
+
+
+`
+	fmt.Printf(logo, version.String(), cfg.P2PTCPPort, os.Getpid(), params.ActiveNetParams.Name)
 }

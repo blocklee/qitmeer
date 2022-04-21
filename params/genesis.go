@@ -8,6 +8,7 @@ package params
 
 import (
 	"github.com/Qitmeer/qitmeer/common/hash"
+	"github.com/Qitmeer/qitmeer/core/merkle"
 	"github.com/Qitmeer/qitmeer/core/protocol"
 	"github.com/Qitmeer/qitmeer/core/types"
 	"github.com/Qitmeer/qitmeer/core/types/pow"
@@ -16,6 +17,7 @@ import (
 )
 
 // MainNet ------------------------------------------------------------------------
+var genesisTime = time.Unix(1632913200, 0) //  2021-09-29 19:00:00 GMT+08:00
 
 // genesisCoinbaseTx is the coinbase transaction for the genesis blocks for
 // the main network.
@@ -30,23 +32,73 @@ func buildGenesisCoinbaseTx(net protocol.Network) types.Transaction {
 					OutIndex: 0xffffffff,
 				},
 				SignScript: []byte{
-					0x00, 0x00,
+					0x0f, 0x51, 0x69, 0x74, 0x6d, 0x65, 0x65, 0x72, 0x20, 0x6d, 0x61, 0x69,
+					0x6e, 0x6e, 0x65, 0x74, 0x41, 0x45, 0x61, 0x74, 0x20, 0x6e, 0x6f, 0x74,
+					0x20, 0x75, 0x70, 0x20, 0x79, 0x6f, 0x75, 0x72, 0x20, 0x70, 0x72, 0x6f,
+					0x70, 0x65, 0x72, 0x74, 0x79, 0x20, 0x61, 0x6d, 0x6f, 0x6e, 0x67, 0x20,
+					0x79, 0x6f, 0x75, 0x72, 0x73, 0x65, 0x6c, 0x76, 0x65, 0x73, 0x20, 0x69,
+					0x6e, 0x20, 0x76, 0x61, 0x6e, 0x69, 0x74, 0x79, 0x20, 0x28, 0x51, 0x75,
+					0x72, 0x61, 0x6e, 0x20, 0x32, 0x3a, 0x31, 0x38, 0x38, 0x29,
 				},
 				Sequence: 0xffffffff,
 			},
 		},
-		LockTime: 0,
-		Expire:   0,
+
+		TxOut: []*types.TxOutput{
+			{
+				Amount: types.Amount{Value: 0x00000000, Id: types.MEERID},
+				PkScript: hexMustDecode("76a9143846e53e5e952b5cd6023e3ad3cfc75cb93fce0388ac"),
+			},
+		},
+		LockTime:  0,
+		Expire:    0,
+		Timestamp: genesisTime,
+	}
+	return tx
+}
+
+// buildGenesisMappingTx is the mapping transaction for the genesis blocks for
+// the main network.
+func buildGenesisMappingTx(net protocol.Network) types.Transaction {
+	tx := types.Transaction{
+		Version: 1,
+		TxIn: []*types.TxInput{
+			{
+				// Fully null.
+				PreviousOut: types.TxOutPoint{
+					Hash:     hash.Hash{},
+					OutIndex: 0xfffffffe,
+				},
+				SignScript: []byte{
+					0x0f, 0x51, 0x69, 0x74, 0x6d, 0x65, 0x65, 0x72, 0x20, 0x6d, 0x61, 0x69,
+					0x6e, 0x6e, 0x65, 0x74, 0x41, 0x45, 0x61, 0x74, 0x20, 0x6e, 0x6f, 0x74,
+					0x20, 0x75, 0x70, 0x20, 0x79, 0x6f, 0x75, 0x72, 0x20, 0x70, 0x72, 0x6f,
+					0x70, 0x65, 0x72, 0x74, 0x79, 0x20, 0x61, 0x6d, 0x6f, 0x6e, 0x67, 0x20,
+					0x79, 0x6f, 0x75, 0x72, 0x73, 0x65, 0x6c, 0x76, 0x65, 0x73, 0x20, 0x69,
+					0x6e, 0x20, 0x76, 0x61, 0x6e, 0x69, 0x74, 0x79, 0x20, 0x28, 0x51, 0x75,
+					0x72, 0x61, 0x6e, 0x20, 0x32, 0x3a, 0x31, 0x38, 0x38, 0x29,
+				},
+				Sequence: 0xffffffff,
+			},
+		},
+		LockTime:  0,
+		Expire:    0,
+		Timestamp: genesisTime,
 	}
 	ledger.Ledger(&tx, net)
 	return tx
 }
 
 var genesisCoinbaseTx = buildGenesisCoinbaseTx(protocol.MainNet)
+var genesisMappingTx = buildGenesisMappingTx(protocol.MainNet)
+var genesisTxs = []*types.Transaction{
+	&genesisCoinbaseTx,
+	&genesisMappingTx,
+}
 
 // mainnetgenesisMerkleRoot is the hash of the first transaction in the genesis block
 // for the main network.
-var genesisMerkleRoot = genesisCoinbaseTx.TxHashFull()
+var genesisMerkleRoot = merkle.CalcMerkleRoot(genesisTxs)
 
 // genesisBlock defines the genesis block of the block chain which serves as the
 // public transaction ledger for the main network.
@@ -65,15 +117,15 @@ var genesisMerkleRoot = genesisCoinbaseTx.TxHashFull()
 var genesisBlock = types.Block{
 	Header: types.BlockHeader{
 		ParentRoot: hash.Hash{},
-		TxRoot:     genesisMerkleRoot,
+		TxRoot:     *genesisMerkleRoot,
 		//UtxoCommitment: types.Hash{},
 		//CompactFilter: types.Hash{},
 		StateRoot:  hash.Hash{},
-		Timestamp:  time.Unix(1561939200, 0), // 2019-07-01 00:00:00 GMT
-		Difficulty: 0x1b01ffff,               // Difficulty 32767
-		Pow:        pow.GetInstance(pow.BLAKE2BD, 0, []byte{}),
+		Timestamp:  genesisTime,
+		Difficulty: 0x1b0fffff, // Difficulty 17 T
+		Pow:        pow.GetInstance(pow.MEERXKECCAKV1, 0, []byte{}),
 	},
-	Transactions: []*types.Transaction{&genesisCoinbaseTx},
+	Transactions: genesisTxs,
 }
 
 // genesisHash is the hash of the first block in the block chain for the main
@@ -134,7 +186,7 @@ func buildTestNetGenesisCoinbaseTx(net protocol.Network) types.Transaction {
 		},
 		LockTime:  0,
 		Expire:    0,
-		Timestamp: time.Unix(1592964000, 0), // 2020/06/24 10:00:00 AM GMT+08:00
+		Timestamp: time.Unix(1627203600, 0), // 2021/07/25 17:00:00 AM GMT+08:00
 	}
 	ledger.Ledger(&tx, net)
 	return tx
@@ -151,12 +203,11 @@ var testNetGenesisMerkleRoot = testNetGenesisCoinbaseTx.TxHashFull()
 // serves as the public transaction ledger for the test network (version 3).
 var testNetGenesisBlock = types.Block{
 	Header: types.BlockHeader{
-		Version:    3,
 		ParentRoot: hash.Hash{},
 		TxRoot:     testNetGenesisMerkleRoot,
-		Timestamp:  testNetGenesisCoinbaseTx.Timestamp,   // same with the tx timestamp (added since 0.9)
-		Difficulty: 0x34ad1ec,                //4903404
-		Pow:        pow.GetInstance(pow.CUCKAROOM, 0, []byte{}),
+		Timestamp:  testNetGenesisCoinbaseTx.Timestamp, // same with the tx timestamp (added since 0.9)
+		Difficulty: 0x1f0198f2,                         // 67108864
+		Pow:        pow.GetInstance(pow.MEERXKECCAKV1, 0, []byte{}),
 	},
 	Transactions: []*types.Transaction{&testNetGenesisCoinbaseTx},
 }
@@ -192,7 +243,7 @@ var privNetGenesisCoinbaseTx = types.Transaction{
 	},
 	TxOut: []*types.TxOutput{
 		{
-			Amount: 0x00000000,
+			Amount: types.Amount{Value: 0x00000000, Id: types.MEERID},
 			PkScript: []byte{
 				0x41, 0x04, 0x67, 0x8a, 0xfd, 0xb0, 0xfe, 0x55, /* |A.g....U| */
 				0x48, 0x27, 0x19, 0x67, 0xf1, 0xa6, 0x71, 0x30, /* |H'.g..q0| */
@@ -210,10 +261,56 @@ var privNetGenesisCoinbaseTx = types.Transaction{
 	Expire:   0,
 }
 
+var privNetGenesisTx1 = buildPrvNetGenesisTxOne()
+
+func buildPrvNetGenesisTxOne() types.Transaction {
+	tx := types.Transaction{
+		Version: 1,
+		TxIn: []*types.TxInput{
+			{
+				PreviousOut: types.TxOutPoint{
+					Hash:     hash.Hash{},
+					OutIndex: 0xffffffff,
+				},
+				Sequence: 0xffffffff,
+				SignScript: []byte{
+					0x04, 0xff, 0xff, 0x00, 0x1d, 0x01, 0x04, 0x45, /* |.......E| */
+					0x54, 0x68, 0x65, 0x20, 0x54, 0x69, 0x6d, 0x65, /* |The Time| */
+					0x73, 0x20, 0x30, 0x33, 0x2f, 0x4a, 0x61, 0x6e, /* |s 03/Jan| */
+					0x2f, 0x32, 0x30, 0x30, 0x39, 0x20, 0x43, 0x68, /* |/2009 Ch| */
+					0x61, 0x6e, 0x63, 0x65, 0x6c, 0x6c, 0x6f, 0x72, /* |ancellor| */
+					0x20, 0x6f, 0x6e, 0x20, 0x62, 0x72, 0x69, 0x6e, /* | on brin| */
+					0x6b, 0x20, 0x6f, 0x66, 0x20, 0x73, 0x65, 0x63, /* |k of sec|*/
+					0x6f, 0x6e, 0x64, 0x20, 0x62, 0x61, 0x69, 0x6c, /* |ond bail| */
+					0x6f, 0x75, 0x74, 0x20, 0x66, 0x6f, 0x72, 0x20, /* |out for |*/
+					0x62, 0x61, 0x6e, 0x6b, 0x73, /* |banks| */
+				},
+			},
+			{
+				PreviousOut: types.TxOutPoint{
+					Hash:     hash.Hash{},
+					OutIndex: 0xffffffff,
+				},
+				Sequence:   0xffffffff,
+				SignScript: []byte{},
+			},
+		},
+		LockTime: 0,
+		Expire:   0,
+	}
+	ledger.Ledger(&tx, protocol.PrivNet)
+	return tx
+}
+
+var privNetGenesisTxs = []*types.Transaction{
+	&privNetGenesisCoinbaseTx,
+	&privNetGenesisTx1,
+}
+
 // privNetGenesisMerkleRoot is the hash of the first transaction in the genesis
 // block for the simulation test network.  It is the same as the merkle root for
 // the main network.
-var privNetGenesisMerkleRoot = privNetGenesisCoinbaseTx.TxHashFull()
+var privNetGenesisMerkleRoot = merkle.CalcMerkleRoot(privNetGenesisTxs)
 
 var zeroHash = hash.ZeroHash
 
@@ -222,7 +319,7 @@ var zeroHash = hash.ZeroHash
 var privNetGenesisBlock = types.Block{
 	Header: types.BlockHeader{
 		ParentRoot: zeroHash,
-		TxRoot:     privNetGenesisMerkleRoot,
+		TxRoot:     *privNetGenesisMerkleRoot,
 		StateRoot: hash.Hash([32]byte{ // Make go vet happy.
 			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -233,7 +330,7 @@ var privNetGenesisBlock = types.Block{
 		Difficulty: 0x207fffff,               // 545259519
 		Pow:        pow.GetInstance(pow.BLAKE2BD, 0, []byte{}),
 	},
-	Transactions: []*types.Transaction{&privNetGenesisCoinbaseTx},
+	Transactions: privNetGenesisTxs,
 }
 
 // privNetGenesisHash is the hash of the first block in the block chain for the
@@ -243,24 +340,111 @@ var privNetGenesisHash = privNetGenesisBlock.BlockHash()
 // TestMixNet ------------------------------------------------------------------------
 
 //
-var testPowNetGenesisCoinbaseTx = types.Transaction{}
+var testPowNetGenesisCoinbaseTx = types.Transaction{
+	Version: 1,
+	TxIn: []*types.TxInput{
+		{
+			PreviousOut: types.TxOutPoint{
+				Hash:     hash.Hash{},
+				OutIndex: 0xffffffff,
+			},
+			Sequence: 0xffffffff,
+			SignScript: []byte{
+				0x04, 0xff, 0xff, 0x00, 0x1d, 0x01, 0x04, 0x45, /* |.......E| */
+				0x54, 0x68, 0x65, 0x20, 0x54, 0x69, 0x6d, 0x65, /* |The Time| */
+				0x73, 0x20, 0x30, 0x33, 0x2f, 0x4a, 0x61, 0x6e, /* |s 03/Jan| */
+				0x2f, 0x32, 0x30, 0x30, 0x39, 0x20, 0x43, 0x68, /* |/2009 Ch| */
+				0x61, 0x6e, 0x63, 0x65, 0x6c, 0x6c, 0x6f, 0x72, /* |ancellor| */
+				0x20, 0x6f, 0x6e, 0x20, 0x62, 0x72, 0x69, 0x6e, /* | on brin| */
+				0x6b, 0x20, 0x6f, 0x66, 0x20, 0x73, 0x65, 0x63, /* |k of sec|*/
+				0x6f, 0x6e, 0x64, 0x20, 0x62, 0x61, 0x69, 0x6c, /* |ond bail| */
+				0x6f, 0x75, 0x74, 0x20, 0x66, 0x6f, 0x72, 0x20, /* |out for |*/
+				0x62, 0x61, 0x6e, 0x6b, 0x73, /* |banks| */
+			},
+		},
+	},
+	TxOut: []*types.TxOutput{
+		{
+			Amount: types.Amount{Value: 0x00000000, Id: types.MEERID},
+			PkScript: []byte{
+				0x41, 0x04, 0x67, 0x8a, 0xfd, 0xb0, 0xfe, 0x55, /* |A.g....U| */
+				0x48, 0x27, 0x19, 0x67, 0xf1, 0xa6, 0x71, 0x30, /* |H'.g..q0| */
+				0xb7, 0x10, 0x5c, 0xd6, 0xa8, 0x28, 0xe0, 0x39, /* |..\..(.9| */
+				0x09, 0xa6, 0x79, 0x62, 0xe0, 0xea, 0x1f, 0x61, /* |..yb...a| */
+				0xde, 0xb6, 0x49, 0xf6, 0xbc, 0x3f, 0x4c, 0xef, /* |..I..?L.| */
+				0x38, 0xc4, 0xf3, 0x55, 0x04, 0xe5, 0x1e, 0xc1, /* |8..U....| */
+				0x12, 0xde, 0x5c, 0x38, 0x4d, 0xf7, 0xba, 0x0b, /* |..\8M...| */
+				0x8d, 0x57, 0x8a, 0x4c, 0x70, 0x2b, 0x6b, 0xf1, /* |.W.Lp+k.| */
+				0x1d, 0x5f, 0xac, /* |._.| */
+			},
+		},
+	},
+	LockTime: 0,
+	Expire:   0,
+}
+
+var mixNetGenesisTx1 = buildMixNetGenesisTxOne()
+
+func buildMixNetGenesisTxOne() types.Transaction {
+	tx := types.Transaction{
+		Version: 1,
+		TxIn: []*types.TxInput{
+			{
+				PreviousOut: types.TxOutPoint{
+					Hash:     hash.Hash{},
+					OutIndex: 0xffffffff,
+				},
+				Sequence: 0xffffffff,
+				SignScript: []byte{
+					0x04, 0xff, 0xff, 0x00, 0x1d, 0x01, 0x04, 0x45, /* |.......E| */
+					0x54, 0x68, 0x65, 0x20, 0x54, 0x69, 0x6d, 0x65, /* |The Time| */
+					0x73, 0x20, 0x30, 0x33, 0x2f, 0x4a, 0x61, 0x6e, /* |s 03/Jan| */
+					0x2f, 0x32, 0x30, 0x30, 0x39, 0x20, 0x43, 0x68, /* |/2009 Ch| */
+					0x61, 0x6e, 0x63, 0x65, 0x6c, 0x6c, 0x6f, 0x72, /* |ancellor| */
+					0x20, 0x6f, 0x6e, 0x20, 0x62, 0x72, 0x69, 0x6e, /* | on brin| */
+					0x6b, 0x20, 0x6f, 0x66, 0x20, 0x73, 0x65, 0x63, /* |k of sec|*/
+					0x6f, 0x6e, 0x64, 0x20, 0x62, 0x61, 0x69, 0x6c, /* |ond bail| */
+					0x6f, 0x75, 0x74, 0x20, 0x66, 0x6f, 0x72, 0x20, /* |out for |*/
+					0x62, 0x61, 0x6e, 0x6b, 0x73, /* |banks| */
+				},
+			},
+			{
+				PreviousOut: types.TxOutPoint{
+					Hash:     hash.Hash{},
+					OutIndex: 0xffffffff,
+				},
+				Sequence:   0xffffffff,
+				SignScript: []byte{},
+			},
+		},
+		Timestamp: time.Unix(1632700998, 0), // 2021-09-27 08:03:18
+		LockTime:  0,
+		Expire:    0,
+	}
+	ledger.Ledger(&tx, protocol.MixNet)
+	return tx
+}
+
+var mixNetGenesisTxs = []*types.Transaction{
+	&testPowNetGenesisCoinbaseTx,
+	&mixNetGenesisTx1,
+}
 
 // testNetGenesisMerkleRoot is the hash of the first transaction in the genesis block
 // for the test network.
-var testPowNetGenesisMerkleRoot = testPowNetGenesisCoinbaseTx.TxHashFull()
+var testPowNetGenesisMerkleRoot = merkle.CalcMerkleRoot(mixNetGenesisTxs)
 
 // testNetGenesisBlock defines the genesis block of the block chain which
 // serves as the public transaction ledger for the test network (version 3).
 var testPowNetGenesisBlock = types.Block{
 	Header: types.BlockHeader{
-		Version:    16,
 		ParentRoot: hash.Hash{},
-		TxRoot:     testPowNetGenesisMerkleRoot,
-		Timestamp:  time.Unix(1547735581, 0), // 2019-01-17 14:33:12 GMT
-		Difficulty: 0x1e00ffff,
-		Pow:        pow.GetInstance(pow.BLAKE2BD, 0, []byte{}),
+		TxRoot:     *testPowNetGenesisMerkleRoot,
+		Timestamp:  time.Unix(1632273458, 0), // 2021-09-22 09:17:38
+		Difficulty: 0x1c00ffff,               // 1T diff
+		Pow:        pow.GetInstance(pow.MEERXKECCAKV1, 0, []byte{}),
 	},
-	Transactions: []*types.Transaction{&testPowNetGenesisCoinbaseTx},
+	Transactions: mixNetGenesisTxs,
 	Parents:      []*hash.Hash{},
 }
 

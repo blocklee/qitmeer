@@ -13,10 +13,10 @@ import (
 const (
 	// InitialProcotolVersion is the initial protocol version for the
 	// network.
-	InitialProcotolVersion uint32 = 20
+	InitialProcotolVersion uint32 = 36
 
 	// ProtocolVersion is the latest protocol version this package supports.
-	ProtocolVersion uint32 = 22
+	ProtocolVersion uint32 = 36
 )
 
 // Network represents which qitmeer network a message belongs to.
@@ -56,20 +56,3 @@ func (n Network) String() string {
 	}
 	return fmt.Sprintf("Unknown Network (%d)", uint32(n))
 }
-
-// ServiceFlag identifies services supported by a peer node.
-type ServiceFlag uint64
-
-const (
-	//  full node.
-	Full ServiceFlag = 1 << iota
-
-	// light node
-	Light
-
-	// a peer supports bloom filtering.
-	Bloom
-
-	// a peer supports committed filters (CFs).
-	CF
-)

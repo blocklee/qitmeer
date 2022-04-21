@@ -64,12 +64,6 @@ func (this *Blake2bd) GetNextDiffBig(weightedSumDiv *big.Int, oldDiffBig *big.In
 	return nextDiffBig
 }
 
-func (this *Blake2bd) PowPercent() *big.Int {
-	targetPercent := big.NewInt(int64(this.params.GetPercentByHeight(this.mainHeight).Blake2bDPercent))
-	targetPercent.Lsh(targetPercent, 32)
-	return targetPercent
-}
-
 func (this *Blake2bd) GetSafeDiff(cur_reduce_diff uint64) *big.Int {
 	limitBits := this.params.Blake2bdPowLimitBits
 	limitBitsBig := CompactToBig(limitBits)
@@ -94,15 +88,12 @@ func (this *Blake2bd) CompareDiff(newTarget *big.Int, target *big.Int) bool {
 // pow proof data
 func (this *Blake2bd) Bytes() PowBytes {
 	r := make(PowBytes, 0)
-	//write nonce 4 bytes
-	n := make([]byte, 4)
-	binary.LittleEndian.PutUint32(n, this.Nonce)
+	// write pow type 1 byte
+	r = append(r, []byte{byte(this.PowType)}...)
+	// write nonce 8 bytes
+	n := make([]byte, 8)
+	binary.LittleEndian.PutUint64(n, this.Nonce)
 	r = append(r, n...)
-
-	t := make([]byte, 1)
-	//write pow type 1 byte
-	t[0] = uint8(this.PowType)
-	r = append(r, t...)
 	//write ProofData 169 bytes
 	r = append(r, this.ProofData[:]...)
 	return PowBytes(r)
@@ -115,7 +106,10 @@ func (this *Blake2bd) BlockData() PowBytes {
 	return PowBytes(bytes[:l-PROOFDATA_LENGTH])
 }
 
-//check pow is available
-func (this *Blake2bd) CheckAvailable() bool {
-	return this.params.GetPercentByHeight(this.mainHeight).Blake2bDPercent > 0
+//solve solution
+func (this *Blake2bd) FindSolver(headerData []byte, blockHash hash.Hash, targetDiffBits uint32) bool {
+	if err := this.Verify(headerData, blockHash, targetDiffBits); err == nil {
+		return true
+	}
+	return false
 }

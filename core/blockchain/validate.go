@@ -11,7 +11,10 @@ import (
 	"encoding/hex"
 	"fmt"
 	"github.com/Qitmeer/qitmeer/common/hash"
+	"github.com/Qitmeer/qitmeer/core/blockchain/opreturn"
+	"github.com/Qitmeer/qitmeer/core/blockchain/token"
 	"github.com/Qitmeer/qitmeer/core/blockdag"
+	"github.com/Qitmeer/qitmeer/core/dbnamespace"
 	"github.com/Qitmeer/qitmeer/core/merkle"
 	"github.com/Qitmeer/qitmeer/core/types"
 	"github.com/Qitmeer/qitmeer/core/types/pow"
@@ -22,11 +25,8 @@ import (
 )
 
 const (
-	// The index of coinbase output for tax
-	CoinbaseOutput_tax = 1
-
-	// The index of coinbase output for custom data. (Can be used for future expansion)
-	CoinbaseOutput_data = 2
+	// The index of coinbase output for subsidy
+	CoinbaseOutput_subsidy = 0
 )
 
 // This function only differs from IsExpired in that it works with a raw wire
@@ -55,11 +55,6 @@ func (b *BlockChain) checkBlockSanity(block *types.SerializedBlock, timeSource M
 	msgBlock := block.Block()
 	header := &msgBlock.Header
 
-	// TODO It can be considered to delete in the future when it is officially launched
-	if header.GetVersion() != b.BlockVersion {
-		return ruleError(ErrBlockVersionTooOld, "block version too old")
-	}
-
 	// A block must have at least one regular transaction.
 	numTx := len(msgBlock.Transactions)
 	if numTx == 0 {
@@ -70,6 +65,11 @@ func (b *BlockChain) checkBlockSanity(block *types.SerializedBlock, timeSource M
 	height, err := ExtractCoinbaseHeight(block.Block().Transactions[0])
 	if err != nil {
 		return err
+	}
+
+	// TODO this hard code fork
+	if !chainParams.CoinbaseConfig.CheckVersion(int64(height), block.Block().Transactions[0].TxIn[0].GetSignScript()) {
+		return ruleError(ErrorCoinbaseBlockVersion, "block coinbase version error")
 	}
 
 	err = checkBlockHeaderSanity(header, timeSource, flags, chainParams, uint(height))
@@ -150,19 +150,14 @@ func (b *BlockChain) checkBlockSanity(block *types.SerializedBlock, timeSource M
 
 	// Do some preliminary checks on each regular transaction to ensure they
 	// are sane before continuing.
-	for i, tx := range transactions {
-		// A block must not have stake transactions in the regular
-		// transaction tree.
-		msgTx := tx.Transaction()
-		txType := types.DetermineTxType(msgTx)
-		if txType != types.TxTypeRegular {
-			errStr := fmt.Sprintf("block contains a irregular "+
-				"transaction in the regular transaction tree at "+
-				"index %d", i)
+	for _, tx := range transactions {
+		if !b.IsValidTxType(types.DetermineTxType(tx.Tx)) {
+			errStr := fmt.Sprintf("%s is not support transaction type.", types.DetermineTxType(tx.Tx).String())
 			return ruleError(ErrIrregTxInRegularTree, errStr)
 		}
-
-		err := CheckTransactionSanity(msgTx, chainParams)
+		// A block must not have stake transactions in the regular
+		// transaction tree.
+		err := CheckTransactionSanity(tx.Transaction(), chainParams)
 		if err != nil {
 			return err
 		}
@@ -180,6 +175,18 @@ func (b *BlockChain) checkBlockSanity(block *types.SerializedBlock, timeSource M
 		str := fmt.Sprintf("block merkle root is invalid - block "+
 			"header indicates %v, but calculated value is %v",
 			header.TxRoot, calculatedMerkleRoot)
+		return ruleError(ErrBadMerkleRoot, str)
+	}
+
+	// Build merkle tree and ensure the calculated merkle root matches the
+	// entry in the block header.  This also has the effect of caching all
+	// of the token balance hashes in the block to speed up future hash
+	// checks.
+	calculatedTokenStateRoot := b.CalculateTokenStateRoot(block.Transactions(), msgBlock.Parents)
+	if !header.StateRoot.IsEqual(&calculatedTokenStateRoot) {
+		str := fmt.Sprintf("block merkle state root is invalid - block "+
+			"header indicates %s, but calculated value is %s",
+			header.StateRoot, calculatedTokenStateRoot)
 		return ruleError(ErrBadMerkleRoot, str)
 	}
 
@@ -227,7 +234,7 @@ func (b *BlockChain) checkBlockSanity(block *types.SerializedBlock, timeSource M
 // are needed to pass along to checkProofOfWork.
 func checkBlockHeaderSanity(header *types.BlockHeader, timeSource MedianTimeSource, flags BehaviorFlags, chainParams *params.Params, mHeight uint) error {
 	instance := pow.GetInstance(header.Pow.GetPowType(), 0, []byte{})
-	instance.SetMainHeight(int64(mHeight))
+	instance.SetMainHeight(pow.MainHeight(mHeight))
 	instance.SetParams(chainParams.PowConfig)
 	if !instance.CheckAvailable() {
 		str := fmt.Sprintf("pow type : %d is not available!", header.Pow.GetPowType())
@@ -277,7 +284,7 @@ func checkProofOfWork(header *types.BlockHeader, powConfig *pow.PowConfig, flags
 	// to avoid proof of work checks is set.
 	if flags&BFNoPoWCheck != BFNoPoWCheck {
 		header.Pow.SetParams(powConfig)
-		header.Pow.SetMainHeight(int64(mHeight))
+		header.Pow.SetMainHeight(pow.MainHeight(mHeight))
 		// The block hash must be less than the claimed target.
 		return header.Pow.Verify(header.BlockData(), header.BlockHash(), header.Difficulty)
 	}
@@ -307,21 +314,24 @@ func CheckTransactionSanity(tx *types.Transaction, params *params.Params) error 
 		return ruleError(ErrTxTooBig, str)
 	}
 
+	if types.IsTokenTx(tx) {
+		update, err := token.NewUpdateFromTx(tx)
+		if err != nil {
+			return err
+		}
+		return update.CheckSanity()
+	}
+
 	// Ensure the transaction amounts are in range.  Each transaction
 	// output must not be negative or more than the max allowed per
 	// transaction.  Also, the total of all outputs must abide by the same
 	// restrictions.  All amounts in a transaction are in a unit value
 	// known as an atom.  One Coin is a quantity of atoms as defined by
 	// the AtomsPerCoin constant.
-	var totalAtom int64
+	totalAtom := make(map[types.CoinID]int64)
 	for _, txOut := range tx.TxOut {
 		atom := txOut.Amount
-		if atom < 0 {
-			str := fmt.Sprintf("transaction output has negative "+
-				"value of %v", atom)
-			return ruleError(ErrInvalidTxOutValue, str)
-		}
-		if atom > types.MaxAmount {
+		if atom.Value > types.MaxAmount {
 			str := fmt.Sprintf("transaction output value of %v is "+
 				"higher than max allowed value of %v", atom,
 				types.MaxAmount)
@@ -331,14 +341,14 @@ func CheckTransactionSanity(tx *types.Transaction, params *params.Params) error 
 		// Two's complement int64 overflow guarantees that any overflow
 		// is detected and reported.
 		// TODO revisit the overflow check
-		totalAtom += int64(atom)
-		if totalAtom < 0 {
+		totalAtom[atom.Id] += atom.Value
+		if totalAtom[atom.Id] < 0 {
 			str := fmt.Sprintf("total value of all transaction "+
 				"outputs exceeds max allowed value of %v",
 				types.MaxAmount)
 			return ruleError(ErrInvalidTxOutValue, str)
 		}
-		if totalAtom > types.MaxAmount {
+		if totalAtom[atom.Id] > types.MaxAmount {
 			str := fmt.Sprintf("total value of all transaction "+
 				"outputs is %v which is higher than max "+
 				"allowed value of %v", totalAtom,
@@ -359,19 +369,7 @@ func CheckTransactionSanity(tx *types.Transaction, params *params.Params) error 
 
 	// Coinbase script length must be between min and max length.
 	if tx.IsCoinBase() {
-		slen := len(tx.TxIn[0].SignScript)
-		if slen < MinCoinbaseScriptLen || slen > MaxCoinbaseScriptLen {
-			str := fmt.Sprintf("coinbase transaction script "+
-				"length of %d is out of range (min: %d, max: "+
-				"%d)", slen, MinCoinbaseScriptLen,
-				MaxCoinbaseScriptLen)
-			return ruleError(ErrBadCoinbaseScriptLen, str)
-		}
-		err := validateCoinbaseTax(tx, params)
-		if err != nil {
-			return err
-		}
-		err = validateCoinbaseCustomData(tx, params)
+		err := validateCoinbase(tx, params)
 		if err != nil {
 			return err
 		}
@@ -391,52 +389,111 @@ func CheckTransactionSanity(tx *types.Transaction, params *params.Params) error 
 	return nil
 }
 
-// Validate the tax in coinbase transaction. Prevent miners from attacking.
-func validateCoinbaseTax(tx *types.Transaction, params *params.Params) error {
-	if len(tx.TxOut) > CoinbaseOutput_tax {
-		slen := len(tx.TxOut[CoinbaseOutput_tax].PkScript)
-		if params.HasTax() {
-			if slen < MinCoinbaseScriptLen || slen > MaxCoinbaseScriptLen {
-				str := fmt.Sprintf("coinbase transaction script "+
-					"length of %d is out of range (min: %d, max: "+
-					"%d)", slen, MinCoinbaseScriptLen,
-					MaxCoinbaseScriptLen)
-				return ruleError(ErrBadCoinbaseScriptLen, str)
-			}
-			orgPkScriptStr := hex.EncodeToString(params.OrganizationPkScript)
-			curPkScriptStr := hex.EncodeToString(tx.TxOut[CoinbaseOutput_tax].PkScript)
-			if orgPkScriptStr != curPkScriptStr {
-				str := fmt.Sprintf("coinbase transaction for block pays to %s, but it is %s",
-					orgPkScriptStr, curPkScriptStr)
-				return ruleError(ErrBadCoinbaseValue, str)
-			}
-		} else {
-			if slen != 0 || tx.TxOut[CoinbaseOutput_tax].Amount != 0 {
-				str := fmt.Sprintf("coinbase transaction error:no tax.")
-				return ruleError(ErrBadCoinbaseValue, str)
-			}
+func validateCoinbase(tx *types.Transaction, pa *params.Params) error {
+	slen := len(tx.TxIn[0].SignScript)
+	if slen < MinCoinbaseScriptLen || slen > MaxCoinbaseScriptLen {
+		str := fmt.Sprintf("coinbase transaction script "+
+			"length of %d is out of range (min: %d, max: "+
+			"%d)", slen, MinCoinbaseScriptLen,
+			MaxCoinbaseScriptLen)
+		return ruleError(ErrBadCoinbaseScriptLen, str)
+	}
+	if pa.HasTax() {
+		err := validateCoinbaseTax(tx, pa)
+		if err != nil {
+			return err
+		}
+	} else {
+		if len(tx.TxOut) <= CoinbaseOutput_subsidy+1 {
+			str := fmt.Sprintf("Coinbase output number error")
+			return ruleError(ErrBadCoinbaseOutpoint, str)
+		}
+		if tx.TxOut[CoinbaseOutput_subsidy].Amount.Id != types.MEERID {
+			str := fmt.Sprintf("Subsidy output amount type is error")
+			return ruleError(ErrBadCoinbaseOutpoint, str)
+		}
+		endIndex := len(tx.TxOut) - 1
+		if !opreturn.IsOPReturn(tx.TxOut[endIndex].PkScript) {
+			str := fmt.Sprintf("TxOutput(%d) must coinbase op return type", endIndex)
+			return ruleError(ErrBadCoinbaseOutpoint, str)
+		}
+		opr, err := opreturn.NewOPReturnFrom(tx.TxOut[endIndex].PkScript)
+		if err != nil {
+			return err
+		}
+		err = opr.Verify(tx)
+		if err != nil {
+			return err
+		}
+
+		err = validateCoinbaseToken(tx.TxOut[1:endIndex])
+		if err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
-// Although it's the interface of the future, we have to deal with it specially.
-func validateCoinbaseCustomData(tx *types.Transaction, params *params.Params) error {
-	if len(tx.TxOut) > CoinbaseOutput_data {
-		// Coinbase TxOut[2] is op return
-		nullDataOut := tx.TxOut[CoinbaseOutput_data]
-		if nullDataOut.Amount != 0 {
-			str := fmt.Sprintf("coinbase output 2:bad nulldata")
+func validateCoinbaseToken(outputs []*types.TxOutput) error {
+	if len(outputs) <= 0 {
+		return nil
+	}
+	for _, v := range outputs {
+		if v.Amount.Id == types.MEERID {
+			continue
+		}
+		if !types.IsKnownCoinID(v.Amount.Id) {
+			str := fmt.Sprintf("Unknown coin %s", v.Amount.Id.Name())
 			return ruleError(ErrBadCoinbaseOutpoint, str)
 		}
-		// The first 4 bytes of the null data output must be the encoded height
-		// of the block, so that every coinbase created has a unique transaction
-		// hash.
-		nullData, err := txscript.ExtractCoinbaseNullData(nullDataOut.PkScript)
-		if err != nil {
-			str := fmt.Sprintf("coinbase output 2:bad nulldata %v", nullData)
+		if v.Amount.Value != 0 {
+			str := fmt.Sprintf("You don't have permission to change the consensus balance: %d", v.Amount.Value)
 			return ruleError(ErrBadCoinbaseOutpoint, str)
 		}
+	}
+	return nil
+}
+
+// Validate the tax in coinbase transaction. Prevent miners from attacking.
+func validateCoinbaseTax(tx *types.Transaction, pa *params.Params) error {
+	if len(tx.TxOut) <= CoinbaseOutput_subsidy+2 {
+		str := fmt.Sprintf("Lack of output")
+		return ruleError(ErrBadCoinbaseOutpoint, str)
+	}
+	if tx.TxOut[CoinbaseOutput_subsidy].Amount.Id != types.MEERID {
+		str := fmt.Sprintf("Subsidy output amount type is error")
+		return ruleError(ErrBadCoinbaseOutpoint, str)
+	}
+	endIndex := len(tx.TxOut) - 1
+	taxIndex := endIndex - 1
+	if !opreturn.IsOPReturn(tx.TxOut[endIndex].PkScript) {
+		str := fmt.Sprintf("TxOutput(%d) must coinbase op return type", endIndex)
+		return ruleError(ErrBadCoinbaseOutpoint, str)
+	}
+
+	opr, err := opreturn.NewOPReturnFrom(tx.TxOut[endIndex].PkScript)
+	if err != nil {
+		return err
+	}
+	err = opr.Verify(tx)
+	if err != nil {
+		return err
+	}
+
+	if tx.TxOut[taxIndex].Amount.Id != types.MEERID {
+		str := fmt.Sprintf("Tax output amount type is error")
+		return ruleError(ErrBadCoinbaseOutpoint, str)
+	}
+	err = validateCoinbaseToken(tx.TxOut[1:taxIndex])
+	if err != nil {
+		return err
+	}
+	orgPkScriptStr := hex.EncodeToString(pa.OrganizationPkScript)
+	curPkScriptStr := hex.EncodeToString(tx.TxOut[taxIndex].PkScript)
+	if orgPkScriptStr != curPkScriptStr {
+		str := fmt.Sprintf("coinbase transaction for block pays to %s, but it is %s",
+			orgPkScriptStr, curPkScriptStr)
+		return ruleError(ErrBadCoinbaseValue, str)
 	}
 	return nil
 }
@@ -485,12 +542,15 @@ func CountSigOps(tx *types.Tx) int {
 //
 // The flags are also passed to checkBlockHeaderContext.  See its documentation
 // for how the flags modify its behavior.
-func (b *BlockChain) checkBlockContext(block *types.SerializedBlock, mainParent *blockNode, flags BehaviorFlags) error {
+func (b *BlockChain) checkBlockContext(block *types.SerializedBlock, mainParent blockdag.IBlock, flags BehaviorFlags) error {
 	// The genesis block is valid by definition.
 	if mainParent == nil {
 		return nil
 	}
-	prevBlock := b.bd.GetBlock(mainParent.GetHash())
+	if !mainParent.GetHash().IsEqual(block.Block().Parents[0]) {
+		return fmt.Errorf("Main parent (%s) is inconsistent in block (%s)\n", mainParent.GetHash().String(), block.Block().Parents[0].String())
+	}
+	prevBlock := mainParent
 
 	// Perform all block header related validation checks.
 	err := b.checkBlockHeaderContext(block, mainParent, flags)
@@ -503,7 +563,7 @@ func (b *BlockChain) checkBlockContext(block *types.SerializedBlock, mainParent 
 		// A block must not exceed the maximum allowed size as defined
 		// by the network parameters and the current status of any hard
 		// fork votes to change it when serialized.
-		maxBlockSize, err := b.maxBlockSize(mainParent)
+		maxBlockSize, err := b.maxBlockSize()
 		if err != nil {
 			return err
 		}
@@ -569,38 +629,48 @@ func (b *BlockChain) checkBlockContext(block *types.SerializedBlock, mainParent 
 }
 
 func (b *BlockChain) checkBlockSubsidy(block *types.SerializedBlock) error {
-	parents := blockdag.NewIdSet()
-	for _, v := range block.Block().Parents {
-		parents.Add(b.index.GetDAGBlockID(v))
-	}
-	blocks := b.bd.GetBlues(parents)
+	bi := b.bd.GetBlueInfoByHash(block.Block().Parents[0])
 	// check subsidy
 	transactions := block.Transactions()
-	subsidy := b.subsidyCache.CalcBlockSubsidy(int64(blocks))
+	subsidy := b.subsidyCache.CalcBlockSubsidy(bi)
 	workAmountOut := int64(0)
+	txoutLen := len(transactions[0].Tx.TxOut)
+	hasOPR := opreturn.IsOPReturn(transactions[0].Tx.TxOut[txoutLen-1].PkScript)
 	for k, v := range transactions[0].Tx.TxOut {
-		if k == CoinbaseOutput_tax || k == CoinbaseOutput_data {
+		// the coinbase should always use meer coin
+		if v.Amount.Id != types.MEERID {
 			continue
 		}
-		workAmountOut += int64(v.Amount)
+		if b.params.HasTax() {
+			if hasOPR {
+				if k == txoutLen-2 {
+					continue
+				}
+				if k == txoutLen-1 {
+					continue
+				}
+			} else {
+				if k == txoutLen-1 {
+					continue
+				}
+			}
+
+		}
+		workAmountOut += v.Amount.Value
 	}
 
 	var work int64
 	var tax int64
 	var taxAmountOut int64 = 0
+	var taxOutput *types.TxOutput
 	var totalAmountOut int64 = 0
 
 	if b.params.HasTax() {
-		if len(transactions[0].Tx.TxOut) < CoinbaseOutput_data {
-			str := fmt.Sprintf("coinbase transaction is illegal")
-			return ruleError(ErrBadCoinbaseValue, str)
-		}
-		work = int64(CalcBlockWorkSubsidy(b.subsidyCache,
-			int64(blocks), b.params))
-		tax = int64(CalcBlockTaxSubsidy(b.subsidyCache,
-			int64(blocks), b.params))
+		work = int64(CalcBlockWorkSubsidy(b.subsidyCache, bi, b.params))
+		tax = int64(CalcBlockTaxSubsidy(b.subsidyCache, bi, b.params))
+		taxOutput = transactions[0].Tx.TxOut[len(transactions[0].Tx.TxOut)-1]
 
-		taxAmountOut = int64(transactions[0].Tx.TxOut[CoinbaseOutput_tax].Amount)
+		taxAmountOut = taxOutput.Amount.Value
 	} else {
 		work = subsidy
 		tax = 0
@@ -624,7 +694,7 @@ func (b *BlockChain) checkBlockSubsidy(block *types.SerializedBlock) error {
 
 	if b.params.HasTax() {
 		orgPkScriptStr := hex.EncodeToString(b.params.OrganizationPkScript)
-		curPkScriptStr := hex.EncodeToString(transactions[0].Tx.TxOut[CoinbaseOutput_tax].PkScript)
+		curPkScriptStr := hex.EncodeToString(taxOutput.PkScript)
 		if orgPkScriptStr != curPkScriptStr {
 			str := fmt.Sprintf("coinbase transaction for block pays to %s, but it is %s",
 				orgPkScriptStr, curPkScriptStr)
@@ -642,7 +712,7 @@ func (b *BlockChain) checkBlockSubsidy(block *types.SerializedBlock) error {
 //    the checkpoints are not performed.
 //
 // This function MUST be called with the chain state lock held (for writes).
-func (b *BlockChain) checkBlockHeaderContext(block *types.SerializedBlock, prevNode *blockNode, flags BehaviorFlags) error {
+func (b *BlockChain) checkBlockHeaderContext(block *types.SerializedBlock, prevNode blockdag.IBlock, flags BehaviorFlags) error {
 	// The genesis block is valid by definition.
 	if prevNode == nil {
 		return nil
@@ -652,7 +722,7 @@ func (b *BlockChain) checkBlockHeaderContext(block *types.SerializedBlock, prevN
 	fastAdd := flags&BFFastAdd == BFFastAdd
 	if !fastAdd {
 		instance := pow.GetInstance(header.Pow.GetPowType(), 0, []byte{})
-		instance.SetMainHeight(int64(prevNode.height + 1))
+		instance.SetMainHeight(pow.MainHeight(prevNode.GetHeight() + 1))
 		instance.SetParams(b.params.PowConfig)
 		// Ensure the difficulty specified in the block header matches
 		// the calculated difficulty based on the previous block and
@@ -672,7 +742,7 @@ func (b *BlockChain) checkBlockHeaderContext(block *types.SerializedBlock, prevN
 
 		// Ensure the timestamp for the block header is after the
 		// median time of the last several blocks (medianTimeBlocks).
-		medianTime := prevNode.CalcPastMedianTime(b)
+		medianTime := b.CalcPastMedianTime(prevNode)
 		if !header.Timestamp.After(medianTime) {
 			str := "block timestamp of %v is not after expected %v"
 			str = fmt.Sprintf(str, header.Timestamp.Unix(), medianTime.Unix())
@@ -686,7 +756,7 @@ func (b *BlockChain) checkBlockHeaderContext(block *types.SerializedBlock, prevN
 	}
 	parents := blockdag.NewIdSet()
 	for _, v := range block.Block().Parents {
-		parents.Add(b.index.GetDAGBlockID(v))
+		parents.Add(b.bd.GetBlockId(v))
 	}
 	blockLayer, ok := b.BlockDAG().GetParentsMaxLayer(parents)
 	if !ok {
@@ -705,10 +775,10 @@ func (b *BlockChain) checkBlockHeaderContext(block *types.SerializedBlock, prevN
 	if err != nil {
 		return err
 	}
-	if checkpointNode != nil && blockLayer < checkpointNode.layer {
+	if checkpointNode != nil && blockLayer < checkpointNode.GetLayer() {
 		str := fmt.Sprintf("block at layer %d forks the main chain "+
 			"before the previous checkpoint at layer %d",
-			blockLayer, checkpointNode.layer)
+			blockLayer, checkpointNode.GetLayer())
 		return ruleError(ErrForkTooOld, str)
 	}
 
@@ -733,7 +803,7 @@ func (b *BlockChain) checkBlockHeaderContext(block *types.SerializedBlock, prevN
 // the bulk of its work.
 //
 // This function MUST be called with the chain state lock held (for writes).
-func (b *BlockChain) checkConnectBlock(node *blockNode, block *types.SerializedBlock, utxoView *UtxoViewpoint, stxos *[]SpentTxOut) error {
+func (b *BlockChain) checkConnectBlock(ib blockdag.IBlock, block *types.SerializedBlock, utxoView *UtxoViewpoint, stxos *[]SpentTxOut) error {
 	// If the side chain blocks end up in the database, a call to
 	// CheckBlockSanity should be done here in case a previous version
 	// allowed a block that is no longer valid.  However, since the
@@ -742,11 +812,10 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block *types.SerializedB
 
 	// The coinbase for the Genesis block is not spendable, so just return
 	// an error now.
-	if node.hash.IsEqual(b.params.GenesisHash) {
+	if ib.GetHash().IsEqual(b.params.GenesisHash) {
 		str := "the coinbase for the genesis block is not spendable"
 		return ruleError(ErrMissingTxOut, str)
 	}
-
 	// Don't run scripts if this node is before the latest known good
 	// checkpoint since the validity is verified via the checkpoints (all
 	// transactions are included in the merkle root hash and any changes
@@ -755,13 +824,13 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block *types.SerializedB
 	// portion of block handling.
 	checkpoint := b.LatestCheckpoint()
 	runScripts := !b.noVerify
-	if checkpoint != nil && uint64(node.GetLayer()) <= checkpoint.Layer {
+	if checkpoint != nil && uint64(ib.GetLayer()) <= checkpoint.Layer {
 		runScripts = false
 	}
 	var scriptFlags txscript.ScriptFlags
 	var err error
 	if runScripts {
-		scriptFlags, err = b.consensusScriptVerifyFlags(node)
+		scriptFlags, err = b.consensusScriptVerifyFlags()
 		if err != nil {
 			return err
 		}
@@ -783,6 +852,10 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block *types.SerializedB
 		return err
 	}
 
+	node := b.GetBlockNode(ib)
+	if node == nil {
+		return fmt.Errorf("Block Node error:%s\n", ib.GetHash().String())
+	}
 	err = b.checkTransactionsAndConnect(node, block, b.subsidyCache, utxoView, stxos)
 	if err != nil {
 		log.Trace("checkTransactionsAndConnect failed", "err", err)
@@ -795,18 +868,22 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block *types.SerializedB
 	// Use the past median time of the *previous* block in order
 	// to determine if the transactions in the current block are
 	// final.
-	prevMedianTime := node.GetMainParent(b).CalcPastMedianTime(b)
+	mainParent := b.bd.GetBlockById(ib.GetMainParent())
+	if mainParent == nil {
+		return fmt.Errorf("Block Main Parent error:%s\n", ib.GetHash().String())
+	}
+	prevMedianTime := b.CalcPastMedianTime(mainParent)
 
 	// Skip the coinbase since it does not have any inputs and thus
 	// lock times do not apply.
 	for _, tx := range block.Transactions() {
-		sequenceLock, err := b.calcSequenceLock(node, tx,
+		sequenceLock, err := b.calcSequenceLock(tx,
 			utxoView, false)
 		if err != nil {
 			return err
 		}
 
-		if !SequenceLockActive(sequenceLock, int64(node.GetHeight()), //TODO, remove type conversion
+		if !SequenceLockActive(sequenceLock, int64(ib.GetHeight()), //TODO, remove type conversion
 			prevMedianTime) {
 
 			str := fmt.Sprintf("block contains " +
@@ -817,7 +894,7 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block *types.SerializedB
 	}
 
 	if runScripts {
-		err = checkBlockScripts(block, utxoView,
+		err = b.checkBlockScripts(block, utxoView,
 			scriptFlags, b.sigCache)
 		if err != nil {
 			log.Trace("checkBlockScripts failed; error returned "+
@@ -826,14 +903,14 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block *types.SerializedB
 		}
 	}
 
-	return nil
+	return b.CheckTokenState(block)
 }
 
 // consensusScriptVerifyFlags returns the script flags that must be used when
 // executing transaction scripts to enforce the consensus rules. This includes
 // any flags required as the result of any agendas that have passed and become
 // active.
-func (b *BlockChain) consensusScriptVerifyFlags(node *blockNode) (txscript.ScriptFlags, error) {
+func (b *BlockChain) consensusScriptVerifyFlags() (txscript.ScriptFlags, error) {
 	//TODO, refactor the txvm flag, the flag should decided by node.parent
 	scriptFlags := txscript.ScriptBip16 |
 		txscript.ScriptVerifyDERSignatures |
@@ -851,7 +928,7 @@ func (b *BlockChain) consensusScriptVerifyFlags(node *blockNode) (txscript.Scrip
 // transaction inputs for a transaction list given a predetermined TxStore.
 // After ensuring the transaction is valid, the transaction is connected to the
 // UTXO viewpoint.  TxTree true == Regular, false == Stake
-func (b *BlockChain) checkTransactionsAndConnect(node *blockNode, block *types.SerializedBlock, subsidyCache *SubsidyCache, utxoView *UtxoViewpoint, stxos *[]SpentTxOut) error {
+func (b *BlockChain) checkTransactionsAndConnect(node *BlockNode, block *types.SerializedBlock, subsidyCache *SubsidyCache, utxoView *UtxoViewpoint, stxos *[]SpentTxOut) error {
 	transactions := block.Transactions()
 	totalSigOpCost := 0
 	for _, tx := range transactions {
@@ -869,23 +946,41 @@ func (b *BlockChain) checkTransactionsAndConnect(node *blockNode, block *types.S
 		}
 	}
 
-	var totalFees int64
+	totalFees := types.AmountMap{}
 	for idx, tx := range transactions {
-		if tx.IsDuplicate && !tx.Tx.IsCoinBase() {
+		if tx.IsDuplicate {
+			if tx.Tx.IsCoinBase() {
+				return ruleError(ErrDuplicateTx, fmt.Sprintf("Coinbase Tx(%s) is duplicate in block(%s)", tx.Hash().String(), block.Hash().String()))
+			}
+			continue
+		}
+		if types.IsTokenTx(tx.Tx) {
+			if types.IsTokenMintTx(tx.Tx) {
+				err := b.CheckTokenTransactionInputs(tx, utxoView)
+				if err != nil {
+					return err
+				}
+				err = utxoView.connectTransaction(tx, node, uint32(idx), stxos, b)
+				if err != nil {
+					return err
+				}
+			}
 			continue
 		}
 		txFee, err := b.CheckTransactionInputs(tx, utxoView)
 		if err != nil {
 			return err
 		}
-
 		// Sum the total fees and ensure we don't overflow the
 		// accumulator.
-		lastTotalFees := totalFees
-		totalFees += txFee
-		if totalFees < lastTotalFees {
-			return ruleError(ErrBadFees, "total fees for block "+
-				"overflows accumulator")
+		for _, coinId := range types.CoinIDList {
+			lastTotalFees := totalFees[coinId]
+			totalFees[coinId] += txFee[coinId]
+			if totalFees[coinId] < lastTotalFees {
+				return ruleError(ErrBadFees, "total fees for block "+
+					"overflows accumulator")
+			}
+
 		}
 
 		err = utxoView.connectTransaction(tx, node, uint32(idx), stxos, b)
@@ -1013,21 +1108,22 @@ func CountP2SHSigOps(tx *types.Tx, isCoinBaseTx bool, utxoView *UtxoViewpoint) (
 //
 // NOTE: The transaction MUST have already been sanity checked with the
 // CheckTransactionSanity function prior to calling this function.
-func (b *BlockChain) CheckTransactionInputs(tx *types.Tx, utxoView *UtxoViewpoint) (int64, error) {
+func (b *BlockChain) CheckTransactionInputs(tx *types.Tx, utxoView *UtxoViewpoint) (types.AmountMap, error) {
 	msgTx := tx.Transaction()
 
 	txHash := tx.Hash()
-	var totalAtomIn int64
+	totalAtomIn := make(map[types.CoinID]int64)
 
 	// Coinbase transactions have no inputs.
 	if msgTx.IsCoinBase() {
-		return 0, nil
+		return nil, nil
 	}
 	bd := b.bd
 	// -------------------------------------------------------------------
 	// General transaction testing.
 	// -------------------------------------------------------------------
 	targets := []uint{}
+
 	for idx, txIn := range msgTx.TxIn {
 		utxoEntry := utxoView.LookupEntry(txIn.PreviousOut)
 		if utxoEntry == nil || utxoEntry.IsSpent() {
@@ -1035,19 +1131,17 @@ func (b *BlockChain) CheckTransactionInputs(tx *types.Tx, utxoView *UtxoViewpoin
 				"transaction %s:%d either does not exist or "+
 				"has already been spent", txIn.PreviousOut,
 				txHash, idx)
-			return 0, ruleError(ErrMissingTxOut, str)
+			return nil, ruleError(ErrMissingTxOut, str)
+		}
+
+		// Ensure the coinId is known
+		err := types.CheckCoinID(utxoEntry.amount.Id)
+		if err != nil {
+			return nil, err
 		}
 
 		// Ensure the transaction is not spending coins which have not
 		// yet reached the required coinbase maturity.
-		if utxoEntry.IsCoinBase() {
-			ubhIB := bd.GetBlock(utxoEntry.BlockHash())
-			if ubhIB == nil {
-				str := fmt.Sprintf("utxoEntry blockhash error:%s", utxoEntry.BlockHash())
-				return 0, ruleError(ErrNoViewpoint, str)
-			}
-			targets = append(targets, ubhIB.GetID())
-		}
 
 		// Ensure the transaction amounts are in range.  Each of the
 		// output values of the input transactions must not be negative
@@ -1055,34 +1149,49 @@ func (b *BlockChain) CheckTransactionInputs(tx *types.Tx, utxoView *UtxoViewpoin
 		// in a transaction are in a unit value known as an atom.  One
 		// Coin is a quantity of atoms as defined by the AtomPerCoin
 		// constant.
-		originTxAtom := int64(utxoEntry.Amount())
-		if utxoEntry.IsCoinBase() && txIn.PreviousOut.OutIndex == 0 {
-			originTxAtom += b.GetFees(utxoEntry.BlockHash())
+		originTxAtom := utxoEntry.Amount()
+
+		if utxoEntry.IsCoinBase() {
+			ubhIB := bd.GetBlock(utxoEntry.BlockHash())
+			if ubhIB == nil {
+				str := fmt.Sprintf("utxoEntry blockhash error:%s", utxoEntry.BlockHash())
+				return nil, ruleError(ErrNoViewpoint, str)
+			}
+			targets = append(targets, ubhIB.GetID())
+			if !utxoEntry.BlockHash().IsEqual(b.params.GenesisHash) {
+				if originTxAtom.Id == types.MEERID {
+					if txIn.PreviousOut.OutIndex == CoinbaseOutput_subsidy {
+						originTxAtom.Value += b.GetFeeByCoinID(utxoEntry.BlockHash(), originTxAtom.Id)
+					}
+				} else {
+					originTxAtom.Value = b.GetFeeByCoinID(utxoEntry.BlockHash(), originTxAtom.Id)
+				}
+			}
 		}
-		if originTxAtom < 0 {
+		if originTxAtom.Value < 0 {
 			str := fmt.Sprintf("transaction output has negative "+
 				"value of %v", originTxAtom)
-			return 0, ruleError(ErrInvalidTxOutValue, str)
+			return nil, ruleError(ErrInvalidTxOutValue, str)
 		}
-		if originTxAtom > types.MaxAmount {
+		if originTxAtom.Value > types.MaxAmount {
 			str := fmt.Sprintf("transaction output value of %v is "+
 				"higher than max allowed value of %v",
 				originTxAtom, types.MaxAmount)
-			return 0, ruleError(ErrInvalidTxOutValue, str)
+			return nil, ruleError(ErrInvalidTxOutValue, str)
 		}
 
 		// The total of all outputs must not be more than the max
 		// allowed per transaction.  Also, we could potentially
 		// overflow the accumulator so check for overflow.
 		lastAtomIn := totalAtomIn
-		totalAtomIn += originTxAtom
-		if totalAtomIn < lastAtomIn ||
-			totalAtomIn > types.MaxAmount {
+		totalAtomIn[originTxAtom.Id] += originTxAtom.Value
+		if totalAtomIn[originTxAtom.Id] < lastAtomIn[originTxAtom.Id] ||
+			totalAtomIn[originTxAtom.Id] > types.MaxAmount {
 			str := fmt.Sprintf("total value of all transaction "+
 				"inputs is %v which is higher than max "+
 				"allowed value of %v", totalAtomIn,
 				types.MaxAmount)
-			return 0, ruleError(ErrInvalidTxOutValue, str)
+			return nil, ruleError(ErrInvalidTxOutValue, str)
 		}
 	}
 
@@ -1096,36 +1205,63 @@ func (b *BlockChain) CheckTransactionInputs(tx *types.Tx, utxoView *UtxoViewpoin
 		}
 		if len(viewpoints) == 0 {
 			str := fmt.Sprintf("transaction %s has no viewpoints", txHash)
-			return 0, ruleError(ErrNoViewpoint, str)
+			return nil, ruleError(ErrNoViewpoint, str)
 		}
 		err := bd.CheckBlueAndMatureMT(targets, viewpoints, uint(b.params.CoinbaseMaturity))
 		if err != nil {
-			return 0, ruleError(ErrImmatureSpend, err.Error())
+			return nil, ruleError(ErrImmatureSpend, err.Error())
 		}
 	}
 
 	// Calculate the total output amount for this transaction.  It is safe
 	// to ignore overflow and out of range errors here because those error
 	// conditions would have already been caught by checkTransactionSanity.
-	var totalAtomOut int64
+	totalAtomOut := make(map[types.CoinID]int64)
 	for _, txOut := range tx.Transaction().TxOut {
-		totalAtomOut += int64(txOut.Amount) //TODO, remove type conversion
+		// Ensure the coinId is known
+		err := types.CheckCoinID(txOut.Amount.Id)
+		if err != nil {
+			return nil, err
+		}
+		totalAtomOut[txOut.Amount.Id] += txOut.Amount.Value
 	}
 
-	// Ensure the transaction does not spend more than its inputs.
-	if totalAtomIn < totalAtomOut {
-		str := fmt.Sprintf("total value of all transaction inputs for "+
-			"transaction %v is %v which is less than the amount "+
-			"spent of %v", txHash, totalAtomIn, totalAtomOut)
-		return 0, ruleError(ErrSpendTooHigh, str)
+	// Ensure no unbalanced/unknowned coin type from input/output
+	if len(totalAtomIn) != len(totalAtomOut) ||
+		len(totalAtomIn) > len(types.CoinIDList) ||
+		len(totalAtomOut) > len(types.CoinIDList) {
+		return nil, fmt.Errorf("transaction contains unknown or unbalanced coin types")
 	}
 
-	// NOTE: bitcoind checks if the transaction fees are < 0 here, but that
-	// is an impossible condition because of the check above that ensures
-	// the inputs are >= the outputs.
-	txFeeInAtom := totalAtomIn - totalAtomOut
+	allFees := make(map[types.CoinID]int64)
+	for _, coinId := range types.CoinIDList {
+		atomin, okin := totalAtomIn[coinId]
+		atomout, okout := totalAtomOut[coinId]
+		if !okin && !okout {
+			continue
+		} else if !(okin && okout) {
+			str := fmt.Sprintf("transaction output CoinID does not match input. (%s)", coinId.Name())
+			return nil, ruleError(ErrInvalidTxOutValue, str)
+		}
 
-	return txFeeInAtom, nil
+		// Ensure the transaction does not spend more than its inputs.
+		if atomin < atomout {
+			str := fmt.Sprintf("total %s value of all transaction inputs for "+
+				"transaction %v is %v which is less than the amount "+
+				"spent of %v", coinId.Name(), txHash, atomin, atomout)
+			return nil, ruleError(ErrSpendTooHigh, str)
+		}
+		allFees[coinId] = atomin - atomout
+	}
+	state := b.GetTokenState(b.TokenTipID)
+	if state == nil {
+		return nil, fmt.Errorf("No token sate:%d\n", b.TokenTipID)
+	}
+	err := state.CheckFees(allFees)
+	if err != nil {
+		return nil, err
+	}
+	return allFees, nil
 }
 
 // CheckConnectBlockTemplate fully validates that connecting the passed block to
@@ -1150,36 +1286,29 @@ func (b *BlockChain) CheckConnectBlockTemplate(block *types.SerializedBlock) err
 		return err
 	}
 
-	tipsNode := []*blockNode{}
-	for _, v := range block.Block().Parents {
-		bn := b.index.LookupNode(v)
-		if bn == nil {
-			return ruleError(ErrPrevBlockNotBest, "tipsNode")
-		}
-		tipsNode = append(tipsNode, bn)
-	}
-	if len(tipsNode) == 0 {
+	newNode := NewBlockNode(block, block.Block().Parents)
+	virBlock := b.bd.CreateVirtualBlock(newNode)
+	if virBlock == nil {
 		return ruleError(ErrPrevBlockNotBest, "tipsNode")
 	}
-	header := &block.Block().Header
-	newNode := newBlockNode(header, tipsNode)
-	newNode.SetOrder(block.Order())
-	newNode.SetHeight(block.Height())
-	newNode.SetLayer(GetMaxLayerFromList(tipsNode) + 1)
-	newNode.dagID = b.bd.GetBlockTotal()
+	virBlock.SetOrder(uint(block.Order()))
+	if virBlock.GetHeight() != block.Height() {
+		return ruleError(ErrPrevBlockNotBest, "tipsNode height")
+	}
+	mainParent := b.bd.GetBlockById(virBlock.GetMainParent())
+	if mainParent == nil {
+		return ruleError(ErrPrevBlockNotBest, "main parent")
+	}
+
+	err = b.checkBlockContext(block, mainParent, flags)
+	if err != nil {
+		return err
+	}
 
 	view := NewUtxoViewpoint()
 	view.SetViewpoints(block.Block().Parents)
 
-	mainParent := newNode.GetMainParent(b)
-	mainParentNode := b.index.LookupNode(mainParent.GetHash())
-	newNode.CalcWorkSum(mainParentNode)
-
-	err = b.checkBlockContext(block, mainParentNode, flags)
-	if err != nil {
-		return err
-	}
-	err = b.checkConnectBlock(newNode, block, view, nil)
+	err = b.checkConnectBlock(virBlock, block, view, nil)
 	if err != nil {
 		return err
 	}
@@ -1216,4 +1345,113 @@ func ExtractCoinbaseHeight(coinbaseTx *types.Transaction) (uint64, error) {
 	serializedHeight := binary.LittleEndian.Uint64(serializedHeightBytes)
 
 	return serializedHeight, nil
+}
+
+func (b *BlockChain) CheckTokenTransactionInputs(tx *types.Tx, utxoView *UtxoViewpoint) error {
+	msgTx := tx.Transaction()
+	totalAtomIn := int64(0)
+	targets := []uint{}
+
+	for idx, txIn := range msgTx.TxIn {
+		if idx == 0 {
+			continue
+		}
+		utxoEntry := utxoView.LookupEntry(txIn.PreviousOut)
+		if utxoEntry == nil || utxoEntry.IsSpent() {
+			str := fmt.Sprintf("output %v referenced from "+
+				"transaction %s:%d either does not exist or "+
+				"has already been spent", txIn.PreviousOut,
+				tx.Hash(), idx)
+			return ruleError(ErrMissingTxOut, str)
+		}
+		if !utxoEntry.amount.Id.IsBase() {
+			return fmt.Errorf("Token transaction(%s) input (%s %d) must be MEERID\n", tx.Hash(), txIn.PreviousOut.Hash, txIn.PreviousOut.OutIndex)
+		}
+
+		originTxAtom := utxoEntry.Amount()
+		if originTxAtom.Value < 0 {
+			str := fmt.Sprintf("transaction output has negative "+
+				"value of %v", originTxAtom)
+			return ruleError(ErrInvalidTxOutValue, str)
+		}
+		if originTxAtom.Value > types.MaxAmount {
+			str := fmt.Sprintf("transaction output value of %v is "+
+				"higher than max allowed value of %v",
+				originTxAtom, types.MaxAmount)
+			return ruleError(ErrInvalidTxOutValue, str)
+		}
+
+		if utxoEntry.IsCoinBase() {
+			ubhIB := b.bd.GetBlock(utxoEntry.BlockHash())
+			if ubhIB == nil {
+				str := fmt.Sprintf("utxoEntry blockhash error:%s", utxoEntry.BlockHash())
+				return ruleError(ErrNoViewpoint, str)
+			}
+			targets = append(targets, ubhIB.GetID())
+			if !utxoEntry.BlockHash().IsEqual(b.params.GenesisHash) {
+				if originTxAtom.Id == types.MEERID {
+					if txIn.PreviousOut.OutIndex == CoinbaseOutput_subsidy {
+						originTxAtom.Value += b.GetFeeByCoinID(utxoEntry.BlockHash(), originTxAtom.Id)
+					}
+				} else {
+					originTxAtom.Value = b.GetFeeByCoinID(utxoEntry.BlockHash(), originTxAtom.Id)
+				}
+			}
+		}
+
+		totalAtomIn += originTxAtom.Value
+	}
+
+	lockMeer := int64(dbnamespace.ByteOrder.Uint64(msgTx.TxIn[0].PreviousOut.Hash[0:8]))
+	if totalAtomIn != lockMeer {
+		return fmt.Errorf("Utxo (%d) and input amount (%d) are inconsistent\n", totalAtomIn, lockMeer)
+	}
+
+	//
+	if len(targets) > 0 {
+		viewpoints := []uint{}
+		for _, blockHash := range utxoView.viewpoints {
+			vIB := b.bd.GetBlock(blockHash)
+			if vIB != nil {
+				viewpoints = append(viewpoints, vIB.GetID())
+			}
+		}
+		if len(viewpoints) == 0 {
+			str := fmt.Sprintf("transaction %s has no viewpoints", tx.Hash())
+			return ruleError(ErrNoViewpoint, str)
+		}
+		err := b.bd.CheckBlueAndMatureMT(targets, viewpoints, uint(b.params.CoinbaseMaturity))
+		if err != nil {
+			return ruleError(ErrImmatureSpend, err.Error())
+		}
+	}
+	//
+
+	totalAtomOut := int64(0)
+	state := b.GetTokenState(b.TokenTipID)
+	if state == nil {
+		return fmt.Errorf("Token state error\n")
+	}
+	coinId := msgTx.TxOut[0].Amount.Id
+	tt, ok := state.Types[coinId]
+	if !ok {
+		return fmt.Errorf("It doesn't exist: Coin id (%d)\n", coinId)
+	}
+	tokenAmount := int64(0)
+	tb, ok := state.Balances[coinId]
+	if ok {
+		tokenAmount = tb.Balance
+	}
+
+	for idx, txOut := range tx.Transaction().TxOut {
+		if txOut.Amount.Id != coinId {
+			return fmt.Errorf("Transaction(%s) output(%d) coin id is invalid\n", tx.Hash(), idx)
+		}
+		totalAtomOut += txOut.Amount.Value
+	}
+	if totalAtomOut+tokenAmount > int64(tt.UpLimit) {
+		return fmt.Errorf("Token transaction mint (%d) exceeds the maximum (%d)\n", totalAtomOut, tt.UpLimit)
+	}
+
+	return nil
 }

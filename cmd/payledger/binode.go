@@ -17,7 +17,6 @@ import (
 	"github.com/Qitmeer/qitmeer/log"
 	"github.com/Qitmeer/qitmeer/params"
 	"github.com/Qitmeer/qitmeer/services/index"
-	"github.com/Qitmeer/qitmeer/services/mining"
 	"path"
 )
 
@@ -51,7 +50,6 @@ func (node *BINode) init(cfg *Config) error {
 		ChainParams:  params.ActiveNetParams.Params,
 		TimeSource:   blockchain.NewMedianTime(),
 		DAGType:      cfg.DAGType,
-		BlockVersion: mining.BlockVersion(params.ActiveNetParams.Params.Net),
 		IndexManager: indexManager,
 	})
 	if err != nil {
@@ -105,7 +103,7 @@ func (node *BINode) statistics() error {
 			if isTxValid(node.db, block.Transactions()[0].Hash(), &txfullHash, ib.GetHash()) {
 				if node.bc.BlockDAG().IsBlue(i) {
 					subsidyCount++
-					subsidy += block.Transactions()[0].Tx.TxOut[0].Amount
+					subsidy += uint64(block.Transactions()[0].Tx.TxOut[0].Amount.Value)
 				}
 			}
 		}

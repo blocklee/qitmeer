@@ -4,7 +4,9 @@ import (
 	"container/list"
 	"fmt"
 	"github.com/Qitmeer/qitmeer/common/hash"
+	"github.com/Qitmeer/qitmeer/common/math"
 	"github.com/Qitmeer/qitmeer/core/blockdag/anticone"
+	"github.com/Qitmeer/qitmeer/core/dbnamespace"
 	s "github.com/Qitmeer/qitmeer/core/serialization"
 	"github.com/Qitmeer/qitmeer/core/types"
 	"github.com/Qitmeer/qitmeer/database"
@@ -37,14 +39,11 @@ func (ph *Phantom) GetName() string {
 func (ph *Phantom) Init(bd *BlockDAG) bool {
 	ph.bd = bd
 	ph.anticoneSize = anticone.GetSize(anticone.BlockDelay, bd.blockRate, anticone.SecurityLevel)
-
 	if log != nil {
 		log.Info(fmt.Sprintf("anticone size:%d", ph.anticoneSize))
 	}
-
-	ph.bd.order = map[uint]uint{}
-
-	ph.mainChain = &MainChain{NewIdSet(), MaxId, 0}
+	// main chain
+	ph.mainChain = &MainChain{bd, MaxId, 0, NewIdSet()}
 	ph.diffAnticone = NewIdSet()
 
 	//vb
@@ -55,16 +54,16 @@ func (ph *Phantom) Init(bd *BlockDAG) bool {
 }
 
 // Add a block
-func (ph *Phantom) AddBlock(ib IBlock) *list.List {
+func (ph *Phantom) AddBlock(ib IBlock) (*list.List, *list.List) {
 	pb := ib.(*PhantomBlock)
 	pb.SetOrder(MaxBlockOrder)
 
 	ph.updateBlockColor(pb)
 	ph.updateBlockOrder(pb)
 
-	changeBlock := ph.updateMainChain(ph.getBluest(ph.bd.tips), pb)
+	changeBlock, oldOrders := ph.updateMainChain(ph.getBluest(ph.bd.tips), pb)
 	ph.preUpdateVirtualBlock()
-	return ph.getOrderChangeList(changeBlock)
+	return ph.getOrderChangeList(changeBlock), oldOrders
 }
 
 // Build self block
@@ -84,10 +83,7 @@ func (ph *Phantom) updateBlockColor(pb *PhantomBlock) {
 		if diffAnticone == nil {
 			diffAnticone = NewIdSet()
 		}
-
 		ph.calculateBlueSet(pb, diffAnticone)
-
-		ph.UpdateWeight(pb)
 	} else {
 		//It is genesis
 		if !pb.GetHash().IsEqual(ph.bd.GetGenesisHash()) {
@@ -140,11 +136,14 @@ func (ph *Phantom) getKChain(pb *PhantomBlock) *KChain {
 	var blueCount int = 0
 	result := &KChain{NewIdSet(), 0}
 	curPb := pb
+	deep := 0
 	for {
 		result.blocks.AddPair(curPb.GetID(), curPb)
+		blueCount++
+		deep++
 		result.miniLayer = curPb.GetLayer()
 		blueCount += curPb.blueDiffAnticone.Size()
-		if blueCount > ph.anticoneSize || curPb.mainParent == MaxId {
+		if (blueCount > ph.anticoneSize && deep > MaxTipLayerGap*2) || curPb.mainParent == MaxId {
 			break
 		}
 		curPb = ph.getBlock(curPb.mainParent)
@@ -241,11 +240,11 @@ func (ph *Phantom) sortBlocks(lastBlock uint, blueDiffAnticone *IdSet, toSort *I
 	remaining = remaining.Intersection(diffAnticone)
 
 	blueSet := remaining.Intersection(blueDiffAnticone)
-	blueList := blueSet.SortHashList(false)
+	blueList := blueSet.SortPriorityList(true)
 
 	redSet := remaining.Clone()
 	redSet.RemoveSet(blueSet)
-	redList := redSet.SortHashList(false)
+	redList := redSet.SortPriorityList(true)
 
 	result := []uint{}
 	if lastBlock != MaxId && diffAnticone.Has(lastBlock) && toSort.Has(lastBlock) {
@@ -268,26 +267,45 @@ func (ph *Phantom) buildSortDiffAnticone(diffAn *IdSet) *IdSet {
 	return result
 }
 
-func (ph *Phantom) updateMainChain(buestTip *PhantomBlock, pb *PhantomBlock) *PhantomBlock {
+func (ph *Phantom) updateMainChain(buestTip *PhantomBlock, pb *PhantomBlock) (*PhantomBlock, *list.List) {
+	if ph.bd.lastSnapshot.IsValid() {
+		ph.bd.lastSnapshot.diffAnticone = ph.diffAnticone.Clone()
+		ph.bd.lastSnapshot.mainChainTip = ph.mainChain.tip
+		ph.bd.lastSnapshot.mainChainGenesis = ph.mainChain.genesis
+	}
+
 	ph.virtualBlock.SetOrder(MaxBlockOrder)
 	if !ph.isMaxMainTip(buestTip) {
 		ph.diffAnticone.AddPair(pb.GetID(), pb)
-		return nil
+		return nil, nil
 	}
 	if ph.mainChain.tip == MaxId {
 		ph.mainChain.tip = buestTip.GetID()
 		ph.mainChain.genesis = buestTip.GetID()
-		ph.mainChain.blocks.Add(buestTip.GetID())
+		ph.mainChain.commitBlocks.AddPair(buestTip.GetID(), true)
 		ph.diffAnticone.Clean()
 		buestTip.SetOrder(0)
-		ph.bd.order[0] = buestTip.GetID()
-		return buestTip
+		ph.bd.commitOrder[0] = buestTip.GetID()
+		return buestTip, nil
 	}
 
 	intersection, path := ph.getIntersectionPathWithMainChain(buestTip)
-	if intersection == MaxId {
+	intersectionBlock := ph.bd.getBlockById(intersection)
+	if intersectionBlock == nil {
 		panic("DAG can't find intersection!")
 	}
+
+	// old orders
+	oldOrders := list.New()
+	for i := intersectionBlock.GetOrder() + 1; i <= ph.GetMainChainTip().GetOrder(); i++ {
+		ib := ph.bd.getBlockByOrder(i)
+		if ib == nil {
+			panic(fmt.Errorf("DAG can't find block in order(%d)\n", i))
+		}
+		oldOrders.PushBack(&BlockOrderHelp{OldOrder: i, Block: ib})
+	}
+
+	//
 	ph.rollBackMainChain(intersection)
 
 	ph.updateMainOrder(path, intersection)
@@ -295,8 +313,13 @@ func (ph *Phantom) updateMainChain(buestTip *PhantomBlock, pb *PhantomBlock) *Ph
 
 	ph.diffAnticone = ph.bd.getAnticone(ph.bd.getBlockById(ph.mainChain.tip), nil)
 
-	changeOrder := ph.bd.getBlockById(intersection).GetOrder() + 1
-	return ph.getBlock(ph.bd.order[changeOrder])
+	changeOrder := intersectionBlock.GetOrder() + 1
+
+	coPB, ok := ph.bd.getBlockByOrder(changeOrder).(*PhantomBlock)
+	if !ok {
+		return nil, nil
+	}
+	return coPB, oldOrders
 }
 
 func (ph *Phantom) isMaxMainTip(pb *PhantomBlock) bool {
@@ -315,7 +338,7 @@ func (ph *Phantom) getIntersectionPathWithMainChain(pb *PhantomBlock) (uint, []u
 	curPb := pb
 	for {
 
-		if ph.mainChain.blocks.Has(curPb.GetID()) {
+		if ph.mainChain.Has(curPb.GetID()) {
 			intersection = curPb.GetID()
 			break
 		}
@@ -335,7 +358,7 @@ func (ph *Phantom) rollBackMainChain(intersection uint) {
 		if curPb.GetID() == intersection {
 			break
 		}
-		ph.mainChain.blocks.Remove(curPb.GetID())
+		ph.mainChain.commitBlocks.AddPair(curPb.GetID(), false)
 
 		if curPb.mainParent == MaxId {
 			break
@@ -349,18 +372,25 @@ func (ph *Phantom) updateMainOrder(path []uint, intersection uint) {
 	l := len(path)
 	for i := l - 1; i >= 0; i-- {
 		curBlock := ph.getBlock(path[i])
+		ph.bd.lastSnapshot.AddOrder(curBlock)
 		curBlock.SetOrder(startOrder + uint(curBlock.blueDiffAnticone.Size()+curBlock.redDiffAnticone.Size()+1))
-		ph.bd.order[curBlock.GetOrder()] = curBlock.GetID()
-		ph.mainChain.blocks.Add(curBlock.GetID())
+		ph.bd.commitOrder[curBlock.GetOrder()] = curBlock.GetID()
+		ph.bd.commitBlock.AddPair(curBlock.GetID(), curBlock)
+
+		ph.mainChain.commitBlocks.AddPair(curBlock.GetID(), true)
 		for k, v := range curBlock.blueDiffAnticone.GetMap() {
 			dab := ph.getBlock(k)
+			ph.bd.lastSnapshot.AddOrder(dab)
 			dab.SetOrder(startOrder + v.(uint))
-			ph.bd.order[dab.GetOrder()] = dab.GetID()
+			ph.bd.commitOrder[dab.GetOrder()] = dab.GetID()
+			ph.bd.commitBlock.AddPair(dab.GetID(), dab)
 		}
 		for k, v := range curBlock.redDiffAnticone.GetMap() {
 			dab := ph.getBlock(k)
+			ph.bd.lastSnapshot.AddOrder(dab)
 			dab.SetOrder(startOrder + v.(uint))
-			ph.bd.order[dab.GetOrder()] = dab.GetID()
+			ph.bd.commitOrder[dab.GetOrder()] = dab.GetID()
+			ph.bd.commitBlock.AddPair(dab.GetID(), dab)
 		}
 		startOrder = curBlock.GetOrder()
 	}
@@ -399,15 +429,19 @@ func (ph *Phantom) UpdateVirtualBlockOrder() *PhantomBlock {
 	startOrder := ph.getBlock(ph.mainChain.tip).GetOrder()
 	for k, v := range ph.virtualBlock.blueDiffAnticone.GetMap() {
 		dab := ph.getBlock(k)
+		ph.bd.lastSnapshot.AddOrder(dab)
 		dab.SetOrder(startOrder + v.(uint))
-		ph.bd.order[dab.GetOrder()] = dab.GetID()
+		ph.bd.commitOrder[dab.GetOrder()] = dab.GetID()
+		ph.bd.commitBlock.AddPair(dab.GetID(), dab)
 	}
 	for k, v := range ph.virtualBlock.redDiffAnticone.GetMap() {
 		dab := ph.getBlock(k)
+		ph.bd.lastSnapshot.AddOrder(dab)
 		dab.SetOrder(startOrder + v.(uint))
-		ph.bd.order[dab.GetOrder()] = dab.GetID()
+		ph.bd.commitOrder[dab.GetOrder()] = dab.GetID()
+		ph.bd.commitBlock.AddPair(dab.GetID(), dab)
 	}
-
+	ph.bd.lastSnapshot.AddOrder(ph.virtualBlock)
 	ph.virtualBlock.SetOrder(ph.bd.blockTotal + 1)
 
 	return ph.getBlock(ph.mainChain.tip)
@@ -420,7 +454,9 @@ func (ph *Phantom) preUpdateVirtualBlock() *PhantomBlock {
 	}
 	for k := range ph.diffAnticone.GetMap() {
 		dab := ph.getBlock(k)
+		ph.bd.lastSnapshot.AddOrder(dab)
 		dab.SetOrder(MaxBlockOrder)
+		ph.bd.commitBlock.AddPair(dab.GetID(), dab)
 	}
 	return nil
 }
@@ -451,33 +487,10 @@ func (ph *Phantom) GetTipsList() []IBlock {
 	return nil
 }
 
-// Find block hash by order, this is very fast.
-func (ph *Phantom) GetBlockByOrder(order uint) *hash.Hash {
-	if order > ph.GetMainChainTip().GetOrder() {
-		return nil
-	}
-	ib := ph.bd.getBlockById(ph.bd.order[order])
-	if ib != nil {
-		return ib.GetHash()
-	}
-	return nil
-}
-
 // Query whether a given block is on the main chain.
 func (ph *Phantom) IsOnMainChain(b IBlock) bool {
-	if ph.mainChain.blocks.Has(b.GetID()) {
+	if ph.mainChain.Has(b.GetID()) {
 		return true
-	}
-	for cur := ph.getBlock(ph.mainChain.tip); cur != nil; cur = ph.getBlock(cur.mainParent) {
-		if cur.GetHash().IsEqual(b.GetHash()) {
-			return true
-		}
-		if cur.GetLayer() < b.GetLayer() {
-			break
-		}
-		if cur.mainParent == MaxId {
-			break
-		}
 	}
 	return false
 }
@@ -498,9 +511,12 @@ func (ph *Phantom) getOrderChangeList(pb *PhantomBlock) *list.List {
 			refNodes.PushBack(pb)
 		} else if pb.IsOrdered() && pb.GetOrder() <= ph.GetMainChainTip().GetOrder() {
 			for i := ph.GetMainChainTip().GetOrder(); i >= 0; i-- {
-				refNodes.PushFront(ph.getBlock(ph.bd.order[i]))
-				if ph.bd.order[i] == pb.GetID() {
-					break
+				curOrderPb, ok := ph.bd.getBlockByOrder(i).(*PhantomBlock)
+				if ok {
+					refNodes.PushFront(curOrderPb)
+					if curOrderPb.GetID() == pb.GetID() {
+						break
+					}
 				}
 			}
 		}
@@ -519,19 +535,31 @@ func (ph *Phantom) GetMainChainTip() IBlock {
 	return ph.bd.getBlockById(ph.mainChain.tip)
 }
 
+func (ph *Phantom) GetMainChainTipId() uint {
+	return ph.mainChain.tip
+}
+
 // return the main parent in the parents
 func (ph *Phantom) GetMainParent(parents *IdSet) IBlock {
 	if parents == nil || parents.IsEmpty() {
 		return nil
 	}
 	if parents.Size() == 1 {
-		return ph.getBlock(parents.List()[0])
+		ib := ph.getBlock(parents.List()[0])
+		if ib == nil {
+			return nil
+		}
+		return ib
 	}
 	return ph.getBluest(parents)
 }
 
 func (ph *Phantom) getBlock(id uint) *PhantomBlock {
-	return ph.bd.getBlockById(id).(*PhantomBlock)
+	ib := ph.bd.getBlockById(id)
+	if ib == nil {
+		return nil
+	}
+	return ib.(*PhantomBlock)
 }
 
 func (ph *Phantom) GetDiffAnticone() *IdSet {
@@ -562,14 +590,22 @@ func (ph *Phantom) Decode(r io.Reader) error {
 
 // load
 func (ph *Phantom) Load(dbTx database.Tx) error {
+	tips, err := DBGetDAGTips(dbTx)
+	if err != nil {
+		return err
+	}
 
 	ph.mainChain.genesis = 0
+	ph.mainChain.tip = tips[0]
 
 	for i := uint(0); i < ph.bd.blockTotal; i++ {
 		block := Block{id: i}
 		ib := ph.CreateBlock(&block)
 		err := DBGetDAGBlock(dbTx, ib)
 		if err != nil {
+			if err.(*DAGError).IsEmpty() {
+				continue
+			}
 			return err
 		}
 		if i == 0 && !ib.GetHash().IsEqual(ph.bd.GetGenesisHash()) {
@@ -588,24 +624,32 @@ func (ph *Phantom) Load(dbTx database.Tx) error {
 		}
 		ph.bd.blocks[ib.GetID()] = ib
 
-		ph.bd.updateTips(ib)
 		//
-		ph.bd.order[ib.GetOrder()] = ib.GetID()
-
 		if !ib.IsOrdered() {
 			ph.diffAnticone.AddPair(ib.GetID(), ib)
+		} else {
+			// check order index
+			id, err := DBGetBlockIdByOrder(dbTx, ib.GetOrder())
+			if err != nil {
+				return err
+			}
+			if uint(id) != ib.GetID() {
+				return fmt.Errorf("The order(%d) of %s is inconsistent: Order Index (%d)\n", ib.GetOrder(), ib.GetHash(), id)
+			}
 		}
+		block.data = ph.bd.getBlockData(ib.GetHash())
 	}
-
-	ph.mainChain.tip = ph.GetMainParent(ph.bd.tips).GetID()
-
-	for cur := ph.getBlock(ph.mainChain.tip); cur != nil; cur = ph.getBlock(cur.mainParent) {
-		ph.mainChain.blocks.Add(cur.GetID())
-		if cur.mainParent == MaxId {
-			break
+	// load tips
+	for _, v := range tips {
+		tip := ph.getBlock(v)
+		if tip == nil {
+			return fmt.Errorf("Can't find tip:%d\n", v)
 		}
+		ph.bd.updateTips(tip)
 	}
-	return nil
+	ph.bd.optimizeTips(dbTx)
+
+	return ph.CheckMainChainDB(dbTx)
 }
 
 func (ph *Phantom) GetBlues(parents *IdSet) uint {
@@ -619,7 +663,7 @@ func (ph *Phantom) GetBlues(parents *IdSet) uint {
 	}
 
 	//vb
-	vb := &Block{hash: hash.ZeroHash, layer: 0, mainParent: MaxId}
+	vb := &Block{hash: hash.ZeroHash, layer: 0, mainParent: MaxId, parents: parents}
 	pb := &PhantomBlock{vb, 0, NewIdSet(), NewIdSet()}
 
 	tp := ph.GetMainParent(parents).(*PhantomBlock)
@@ -683,30 +727,40 @@ func (ph *Phantom) IsDAG(parents []IBlock) bool {
 		return false
 	} else if len(parents) == 1 {
 		return true
-	} else {
-		parentsSet := NewIdSet()
-		for _, v := range parents {
-			ib := v.(IBlock)
-			parentsSet.AddPair(v.GetID(), ib)
+	}
+	tp := parents[0]
+	ops := NewIdSet()
+	//
+	minTipLayer := uint(math.MaxUint32)
+	for _, v := range parents {
+		ib := v.(IBlock)
+		if ib == nil ||
+			ib.GetID() == tp.GetID() {
+			continue
 		}
-
-		vb := &Block{hash: hash.ZeroHash, layer: 0}
-		pb := &PhantomBlock{vb, 0, NewIdSet(), NewIdSet()}
-		pb.parents = parentsSet.Clone()
-
-		// In the past set
-		//vb
-		tp := ph.GetMainParent(parentsSet).(*PhantomBlock)
-		pb.mainParent = tp.GetID()
-		pb.blueNum = tp.blueNum + 1
-		pb.height = tp.height + 1
-
-		diffAnticone := ph.bd.getDiffAnticone(pb, false)
-		if diffAnticone == nil {
-			diffAnticone = NewIdSet()
+		if ib.GetLayer() < minTipLayer {
+			minTipLayer = ib.GetLayer()
 		}
-		inSet := diffAnticone.Intersection(parentsSet)
-		if inSet.IsEmpty() {
+		ops.Add(ib.GetID())
+	}
+	//
+	mainsubdag := NewIdSet()
+	mainsubdag.Add(0)
+
+	mlg := MaxTipLayerGap
+
+	for curMP := tp; curMP != nil && mlg > 0; curMP = ph.bd.getBlockById(curMP.GetMainParent()) {
+		mainsubdag.Add(curMP.GetID())
+		mainsubdag.AddSet(curMP.(*PhantomBlock).GetBlueDiffAnticone())
+		mainsubdag.AddSet(curMP.(*PhantomBlock).GetRedDiffAnticone())
+
+		if curMP.GetLayer() < minTipLayer {
+			mlg--
+		}
+	}
+
+	for k := range ops.GetMap() {
+		if mainsubdag.Has(k) {
 			return false
 		}
 	}
@@ -732,38 +786,123 @@ func (ph *Phantom) getMaxParents() int {
 }
 
 func (ph *Phantom) UpdateWeight(ib IBlock) {
-	pb := ib.(*PhantomBlock)
-	tp := ph.getBlock(pb.GetMainParent())
-	pb.weight = tp.GetWeight()
-	pb.weight += uint64(ph.bd.calcWeight(int64(pb.blueNum+1), pb.GetHash(), byte(pb.status)))
-	for k := range pb.blueDiffAnticone.GetMap() {
-		bdpb := ph.getBlock(k)
-		pb.weight += uint64(ph.bd.calcWeight(int64(bdpb.blueNum+1), bdpb.GetHash(), byte(bdpb.status)))
-	}
+	if ib.GetID() != GenesisId {
+		pb := ib.(*PhantomBlock)
+		tp := ph.getBlock(pb.GetMainParent())
+		pb.weight = tp.GetWeight()
 
-	// TODO The next consensus version will be opened again
-	/*
-		if ph.bd.db == nil {
-			return
+		pb.weight += uint64(ph.bd.calcWeight(pb, ph.bd.getBlueInfo(pb)))
+		for k := range pb.blueDiffAnticone.GetMap() {
+			bdpb := ph.getBlock(k)
+			pb.weight += uint64(ph.bd.calcWeight(bdpb, ph.bd.getBlueInfo(bdpb)))
 		}
+		ph.bd.commitBlock.AddPair(ib.GetID(), ib)
+	}
+}
 
-		err := ph.bd.db.Update(func(dbTx database.Tx) error {
-			err := DBPutDAGBlock(dbTx, ib)
-			if err != nil {
-				return err
-			}
-			return nil
-		})
-		if err != nil {
-			log.Error(err.Error())
-		}*/
+func (ph *Phantom) CheckMainChainDB(dbTx database.Tx) error {
+	mainChainM := map[uint]bool{}
+	var cur *PhantomBlock
+	for cur = ph.getBlock(ph.mainChain.tip); cur != nil; cur = ph.getBlock(cur.mainParent) {
+		mainChainM[cur.id] = true
+		if cur.mainParent == MaxId {
+			break
+		}
+	}
+	if cur.id != 0 {
+		return fmt.Errorf("Main chain genesis error:%d %s\n", cur.id, cur.GetHash().String())
+	}
+	bucket := dbTx.Metadata().Bucket(dbnamespace.DagMainChainBucketName)
+	cursor := bucket.Cursor()
+	mcLen := int(0)
+	for cok := cursor.First(); cok; cok = cursor.Next() {
+		id := dbnamespace.ByteOrder.Uint32(cursor.Key())
+		_, ok := mainChainM[uint(id)]
+		if !ok {
+			return fmt.Errorf("Main chain error:invalid %d\n", id)
+		}
+		mcLen++
+	}
+	if len(mainChainM) != mcLen {
+		return fmt.Errorf("Inconsistent main chain length:%d != %d\n", len(mainChainM), mcLen)
+	}
+	return nil
 }
 
 // The main chain of DAG is support incremental expansion
 type MainChain struct {
-	blocks  *IdSet
+	bd      *BlockDAG
 	tip     uint
 	genesis uint
+
+	commitBlocks *IdSet
+}
+
+func (mc *MainChain) Has(id uint) bool {
+	result := false
+
+	if mc.commitBlocks.Has(id) {
+		opt := mc.commitBlocks.Get(id)
+		add, ok := opt.(bool)
+		if ok {
+			if add {
+				return true
+			}
+		}
+	}
+
+	mc.bd.db.View(func(dbTx database.Tx) error {
+		meta := dbTx.Metadata()
+		mchBucket := meta.Bucket(dbnamespace.DagMainChainBucketName)
+		if mchBucket == nil {
+			return nil
+		}
+		result = DBHasMainChainBlock(dbTx, id)
+		return nil
+	})
+	return result
+}
+
+func (mc *MainChain) Add(id uint) error {
+	return mc.bd.db.Update(func(dbTx database.Tx) error {
+		meta := dbTx.Metadata()
+		mchBucket := meta.Bucket(dbnamespace.DagMainChainBucketName)
+		if mchBucket == nil {
+			return fmt.Errorf("no %s", string(dbnamespace.DagMainChainBucketName))
+		}
+		return DBPutMainChainBlock(dbTx, id)
+	})
+}
+
+func (mc *MainChain) Remove(id uint) error {
+	if !mc.Has(id) {
+		return nil
+	}
+	return mc.bd.db.Update(func(dbTx database.Tx) error {
+		meta := dbTx.Metadata()
+		mchBucket := meta.Bucket(dbnamespace.DagMainChainBucketName)
+		if mchBucket == nil {
+			return fmt.Errorf("no %s", string(dbnamespace.DagMainChainBucketName))
+		}
+		return DBRemoveMainChainBlock(dbTx, id)
+	})
+}
+
+func (mc *MainChain) commit() error {
+	if mc.commitBlocks.IsEmpty() {
+		return nil
+	}
+	for k, v := range mc.commitBlocks.GetMap() {
+		opt, ok := v.(bool)
+		if !ok || !opt {
+			mc.Remove(k)
+		} else {
+			mc.Add(k)
+		}
+	}
+	mc.commitBlocks.Clean()
+
+	return nil
 }
 
 type KChain struct {

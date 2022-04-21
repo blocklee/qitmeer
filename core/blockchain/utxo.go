@@ -4,10 +4,13 @@ package blockchain
 import (
 	"fmt"
 	"github.com/Qitmeer/qitmeer/common/hash"
+	"github.com/Qitmeer/qitmeer/core/blockdag"
 	"github.com/Qitmeer/qitmeer/core/dbnamespace"
+	"github.com/Qitmeer/qitmeer/core/serialization"
 	"github.com/Qitmeer/qitmeer/core/types"
 	"github.com/Qitmeer/qitmeer/database"
 	"github.com/Qitmeer/qitmeer/engine/txscript"
+	"github.com/Qitmeer/qitmeer/params"
 	"sync"
 )
 
@@ -43,8 +46,8 @@ const (
 //
 // The struct is aligned for memory efficiency.
 type UtxoEntry struct {
-	amount      uint64 // The amount of the output.
-	pkScript    []byte // The public key script for the output.
+	amount      types.Amount // The amount of the output.
+	pkScript    []byte       // The public key script for the output.
 	blockHash   hash.Hash
 	packedFlags txoFlags
 }
@@ -85,7 +88,7 @@ func (entry *UtxoEntry) Spend() {
 }
 
 // Amount returns the amount of the output.
-func (entry *UtxoEntry) Amount() uint64 {
+func (entry *UtxoEntry) Amount() types.Amount {
 	return entry.amount
 }
 
@@ -200,6 +203,21 @@ func (view *UtxoViewpoint) addTxOut(outpoint types.TxOutPoint, txOut *types.TxOu
 	}
 }
 
+func (view *UtxoViewpoint) AddTokenTxOut(outpoint types.TxOutPoint, pkscript []byte) {
+	entry := view.LookupEntry(outpoint)
+	if entry == nil {
+		entry = new(UtxoEntry)
+		view.entries[outpoint] = entry
+	}
+	if len(pkscript) <= 0 {
+		pkscript = params.ActiveNetParams.Params.TokenAdminPkScript
+	}
+	txOut := &types.TxOutput{PkScript: pkscript}
+	entry.amount = txOut.Amount
+	entry.pkScript = txOut.PkScript
+	entry.packedFlags = tfModified
+}
+
 // Viewpoints returns the hash of the viewpoint block in the chain the view currently
 // respresents.
 func (view *UtxoViewpoint) Viewpoints() []*hash.Hash {
@@ -287,7 +305,7 @@ func (view *UtxoViewpoint) fetchInputUtxos(db database.DB, block *types.Serializ
 	txInFlight := map[hash.Hash]int{}
 	transactions := block.Transactions()
 	for i, tx := range transactions {
-		if tx.IsDuplicate {
+		if tx.IsDuplicate || types.IsTokenTx(tx.Tx) {
 			continue
 		}
 		txInFlight[*tx.Hash()] = i
@@ -301,7 +319,14 @@ func (view *UtxoViewpoint) fetchInputUtxos(db database.DB, block *types.Serializ
 		if tx.IsDuplicate {
 			continue
 		}
-		for _, txIn := range tx.Transaction().TxIn {
+		if types.IsTokenTx(tx.Tx) && !types.IsTokenMintTx(tx.Tx) {
+			continue
+		}
+
+		for txInIdx, txIn := range tx.Transaction().TxIn {
+			if txInIdx == 0 && types.IsTokenMintTx(tx.Tx) {
+				continue
+			}
 			// It is acceptable for a transaction input to reference
 			// the output of another transaction in this block only
 			// if the referenced transaction comes before the
@@ -370,7 +395,7 @@ func (view *UtxoViewpoint) fetchUtxos(db database.DB, outpoints map[types.TxOutP
 // spent.  In addition, when the 'stxos' argument is not nil, it will be updated
 // to append an entry for each spent txout.  An error will be returned if the
 // view does not contain the required utxos.
-func (view *UtxoViewpoint) connectTransaction(tx *types.Tx, node *blockNode, blockIndex uint32, stxos *[]SpentTxOut, bc *BlockChain) error {
+func (view *UtxoViewpoint) connectTransaction(tx *types.Tx, node *BlockNode, blockIndex uint32, stxos *[]SpentTxOut, bc *BlockChain) error {
 	msgTx := tx.Transaction()
 	// Coinbase transactions don't have any inputs to spend.
 	if msgTx.IsCoinBase() {
@@ -383,6 +408,9 @@ func (view *UtxoViewpoint) connectTransaction(tx *types.Tx, node *blockNode, blo
 	// if a slice was provided for the spent txout details, append an entry
 	// to it.
 	for txInIndex, txIn := range msgTx.TxIn {
+		if txInIndex == 0 && types.IsTokenMintTx(tx.Tx) {
+			continue
+		}
 		entry := view.entries[txIn.PreviousOut]
 
 		// Ensure the referenced utxo exists in the view.  This should
@@ -404,15 +432,18 @@ func (view *UtxoViewpoint) connectTransaction(tx *types.Tx, node *blockNode, blo
 		// in the utxo set.
 		var stxo = SpentTxOut{
 			Amount:     entry.Amount(),
-			OriAmount:  entry.Amount(),
+			Fees:       types.Amount{Value: 0, Id: entry.Amount().Id},
 			PkScript:   entry.PkScript(),
 			BlockHash:  entry.blockHash,
 			IsCoinBase: entry.IsCoinBase(),
 			TxIndex:    uint32(tx.Index()),
 			TxInIndex:  uint32(txInIndex),
 		}
-		if stxo.IsCoinBase && txIn.PreviousOut.OutIndex == 0 {
-			stxo.Amount += uint64(bc.GetFees(&stxo.BlockHash))
+		if stxo.IsCoinBase && !entry.BlockHash().IsEqual(bc.params.GenesisHash) {
+			if txIn.PreviousOut.OutIndex == CoinbaseOutput_subsidy ||
+				entry.Amount().Id != types.MEERID {
+				stxo.Fees.Value = bc.GetFeeByCoinID(&stxo.BlockHash, stxo.Fees.Id)
+			}
 		}
 		// Append the entry to the provided spent txouts slice.
 		*stxos = append(*stxos, stxo)
@@ -444,6 +475,11 @@ func (view *UtxoViewpoint) disconnectTransactions(block *types.SerializedBlock, 
 		tx := transactions[txIdx]
 		if tx.IsDuplicate {
 			continue
+		}
+		if types.IsTokenTx(tx.Tx) {
+			if !types.IsTokenMintTx(tx.Tx) {
+				continue
+			}
 		}
 		var packedFlags txoFlags
 		isCoinBase := txIdx == 0
@@ -478,6 +514,9 @@ func (view *UtxoViewpoint) disconnectTransactions(block *types.SerializedBlock, 
 			continue
 		}
 		for txInIdx := len(tx.Tx.TxIn) - 1; txInIdx > -1; txInIdx-- {
+			if types.IsTokenMintTx(tx.Tx) && txInIdx == 0 {
+				continue
+			}
 			stxo := &stxos[stxoIdx]
 			stxoIdx--
 
@@ -488,7 +527,7 @@ func (view *UtxoViewpoint) disconnectTransactions(block *types.SerializedBlock, 
 				view.entries[*originOut] = entry
 			}
 
-			entry.amount = stxo.OriAmount
+			entry.amount = stxo.Amount
 			entry.pkScript = stxo.PkScript
 			entry.blockHash = stxo.BlockHash
 			entry.packedFlags = tfModified
@@ -522,9 +561,9 @@ func (bc *BlockChain) IsInvalidOut(entry *UtxoEntry) bool {
 	if entry.blockHash.IsEqual(&hash.ZeroHash) {
 		return false
 	}
-	node := bc.index.LookupNode(&entry.blockHash)
+	node := bc.BlockDAG().GetBlock(&entry.blockHash)
 	if node != nil {
-		if !bc.index.NodeStatus(node).KnownInvalid() {
+		if !node.GetStatus().KnownInvalid() {
 			return false
 		}
 	}
@@ -557,7 +596,7 @@ func (b *BlockChain) FetchUtxoView(tx *types.Tx) (*UtxoViewpoint, error) {
 	// Request the utxos from the point of view of the end of the main
 	// chain.
 	view := NewUtxoViewpoint()
-	view.SetViewpoints(b.GetMiningTips())
+	view.SetViewpoints(b.GetMiningTips(blockdag.MaxPriority))
 	b.ChainRLock()
 	err := view.fetchUtxosMain(b.db, neededSet)
 	b.ChainRUnlock()
@@ -678,12 +717,14 @@ func dbPutUtxoView(dbTx database.Tx, view *UtxoViewpoint) error {
 	return nil
 }
 
+const UtxoEntryAmountCoinIDSize = 2
+
 // deserializeUtxoEntry decodes a utxo entry from the passed serialized byte
 // slice into a new UtxoEntry using a format that is suitable for long-term
 // storage.  The format is described in detail above.
 func DeserializeUtxoEntry(serialized []byte) (*UtxoEntry, error) {
 	// Deserialize the header code.
-	code, offset := deserializeVLQ(serialized)
+	code, offset := serialization.DeserializeVLQ(serialized)
 	if offset >= len(serialized) {
 		return nil, errDeserialize("unexpected end of data after header")
 	}
@@ -700,6 +741,10 @@ func DeserializeUtxoEntry(serialized []byte) (*UtxoEntry, error) {
 			"utxo: %v", err))
 	}
 	offset += hash.HashSize
+	// Decode amount coinId
+	// Decode amount coinId
+	amountCoinId := byteOrder.Uint16(serialized[offset : offset+SpentTxoutAmountCoinIDSize])
+	offset += SpentTxoutAmountCoinIDSize
 	// Decode the compressed unspent transaction output.
 	amount, pkScript, _, err := decodeCompressedTxOut(serialized[offset:])
 	if err != nil {
@@ -708,7 +753,7 @@ func DeserializeUtxoEntry(serialized []byte) (*UtxoEntry, error) {
 	}
 
 	entry := &UtxoEntry{
-		amount:      amount,
+		amount:      types.Amount{Value: int64(amount), Id: types.CoinID(amountCoinId)},
 		pkScript:    pkScript,
 		blockHash:   *blockHash,
 		packedFlags: 0,
@@ -733,16 +778,19 @@ func serializeUtxoEntry(entry *UtxoEntry) ([]byte, error) {
 	}
 
 	// Calculate the size needed to serialize the entry.
-	size := serializeSizeVLQ(headerCode) + hash.HashSize +
-		compressedTxOutSize(uint64(entry.Amount()), entry.PkScript())
+	size := serialization.SerializeSizeVLQ(headerCode) + hash.HashSize + UtxoEntryAmountCoinIDSize +
+		compressedTxOutSize(uint64(entry.Amount().Value), entry.PkScript())
 
 	// Serialize the header code followed by the compressed unspent
 	// transaction output.
 	serialized := make([]byte, size)
-	offset := putVLQ(serialized, headerCode)
+	offset := serialization.PutVLQ(serialized, headerCode)
 	copy(serialized[offset:offset+hash.HashSize], entry.blockHash.Bytes())
 	offset += hash.HashSize
-	offset += putCompressedTxOut(serialized[offset:], uint64(entry.Amount()),
+	// add Amount coinId
+	byteOrder.PutUint16(serialized[offset:], uint16(entry.Amount().Id))
+	offset += SpentTxoutAmountCoinIDSize
+	putCompressedTxOut(serialized[offset:], uint64(entry.Amount().Value),
 		entry.PkScript())
 
 	return serialized, nil
@@ -754,15 +802,15 @@ func outpointKey(outpoint types.TxOutPoint) *[]byte {
 	// doing byte-wise comparisons will produce them in order.
 	key := outpointKeyPool.Get().(*[]byte)
 	idx := uint64(outpoint.OutIndex)
-	*key = (*key)[:hash.HashSize+serializeSizeVLQ(idx)]
+	*key = (*key)[:hash.HashSize+serialization.SerializeSizeVLQ(idx)]
 	copy(*key, outpoint.Hash[:])
-	putVLQ((*key)[hash.HashSize:], idx)
+	serialization.PutVLQ((*key)[hash.HashSize:], idx)
 	return key
 }
 
 var outpointKeyPool = sync.Pool{
 	New: func() interface{} {
-		b := make([]byte, hash.HashSize+maxUint32VLQSerializeSize)
+		b := make([]byte, hash.HashSize+serialization.MaxUint32VLQSerializeSize)
 		return &b // Pointer to slice to avoid boxing alloc.
 	},
 }

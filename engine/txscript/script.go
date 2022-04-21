@@ -8,7 +8,11 @@ package txscript
 
 import (
 	"bytes"
+	"encoding/hex"
+	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 )
 
 // These are the constants specified for maximums in individual scripts.
@@ -16,6 +20,43 @@ const (
 	MaxOpsPerScript       = 255  // Max number of non-push operations.
 	MaxPubKeysPerMultiSig = 20   // Multisig can't have more sigs than this.
 	MaxScriptElementSize  = 2048 // Max bytes pushable to the stack.
+
+	// pubKeyHashLen is the length of a P2PKH script.
+	pubKeyHashLen = 25
+
+	// scriptHashLen is the length of a P2SH script.
+	scriptHashLen = 23
+
+	// maxLen is the maximum script length supported by ParsePkScript.
+	maxLen = 34
+
+	// minPubKeyHashSigScriptLen is the minimum length of a signature script
+	// that spends a P2PKH output. The length is composed of the following:
+	//   Signature length (1 byte)
+	//   Signature (min 8 bytes)
+	//   Signature hash type (1 byte)
+	//   Public key length (1 byte)
+	//   Public key (33 byte)
+	minPubKeyHashSigScriptLen = 1 + 8 + 1 + 1 + 33
+
+	// maxPubKeyHashSigScriptLen is the maximum length of a signature script
+	// that spends a P2PKH output. The length is composed of the following:
+	//   Signature length (1 byte)
+	//   Signature (max 72 bytes)
+	//   Signature hash type (1 byte)
+	//   Public key length (1 byte)
+	//   Public key (33 byte)
+	maxPubKeyHashSigScriptLen = 1 + 72 + 1 + 1 + 33
+
+	// compressedPubKeyLen is the length in bytes of a compressed public
+	// key.
+	compressedPubKeyLen = 33
+)
+
+var (
+	// ErrUnsupportedScriptType is an error returned when we attempt to
+	// parse/re-compute an output script into a PkScript struct.
+	ErrUnsupportedScriptType = errors.New("unsupported script type")
 )
 
 // isSmallInt returns whether or not the opcode is considered a small integer,
@@ -35,6 +76,83 @@ func IsPayToScriptHash(script []byte) bool {
 		return false
 	}
 	return isScriptHash(pops)
+}
+
+// extractPubKeyHash extracts the public key hash from the passed script if it
+// is a standard pay-to-pubkey-hash script.  It will return nil otherwise.
+func extractPubKeyHash(script []byte) []byte {
+	// A pay-to-pubkey-hash script is of the form:
+	//  OP_DUP OP_HASH160 <20-byte hash> OP_EQUALVERIFY OP_CHECKSIG
+	if len(script) == 25 &&
+		script[0] == OP_DUP &&
+		script[1] == OP_HASH160 &&
+		script[2] == OP_DATA_20 &&
+		script[23] == OP_EQUALVERIFY &&
+		script[24] == OP_CHECKSIG {
+
+		return script[3:23]
+	}
+
+	return nil
+}
+
+// IsPubKeyHashScript returns whether or not the passed script is a standard
+// pay-to-pubkey-hash script.
+func IsPubKeyHashScript(script []byte) bool {
+	return extractPubKeyHash(script) != nil
+}
+
+func PkStringToScript(pk string) ([]byte, error) {
+	builder := NewScriptBuilder()
+	pk = strings.Replace(pk, "\n", " ", -1)
+	pk = strings.Replace(pk, "\t", " ", -1)
+	arr := strings.Split(pk, " ")
+	for i := 0; i < len(arr); i++ {
+		tok := arr[i]
+		if len(tok) == 0 {
+			continue
+		}
+
+		// if parses as a plain number
+		if num, err := strconv.ParseInt(tok, 10, 64); err == nil {
+			builder.AddInt64(num)
+			continue
+		} else if bts, err := hex.DecodeString(tok); err == nil {
+			// Concatenate the bytes manually since the test code
+			// intentionally creates scripts that are too large and
+			// would cause the builder to error otherwise.
+			if builder.err == nil {
+				builder.AddData(bts)
+			}
+		} else if len(tok) >= 2 &&
+			tok[0] == '\'' && tok[len(tok)-1] == '\'' {
+			builder.AddFullData([]byte(tok[1 : len(tok)-1]))
+		} else if opcode, err := findOpcodeFromString(tok); err == nil {
+			builder.AddOp(opcode.value)
+		} else {
+			return nil, fmt.Errorf("bad token %q", tok)
+		}
+	}
+	return builder.Script()
+}
+
+func findOpcodeFromString(pkcode string) (Opcode, error) {
+	for _, v := range opcodeArray {
+		if v.name == pkcode {
+			return v, nil
+		}
+	}
+	return Opcode{}, errors.New("not opcode string")
+}
+
+// IsStrictCompressedPubKeyEncoding returns whether or not the passed public
+// key adheres to the strict compressed encoding requirements.
+func IsStrictCompressedPubKeyEncoding(pubKey []byte) bool {
+	if len(pubKey) == 33 && (pubKey[0] == 0x02 || pubKey[0] == 0x03) {
+		// Compressed
+		return true
+	}
+	return false
 }
 
 // isPushOnly returns true if the script only pushes data, false otherwise.

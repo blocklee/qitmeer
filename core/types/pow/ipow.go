@@ -10,10 +10,10 @@ import (
 	"math/big"
 )
 
-// proof data length 188
-const POW_LENGTH = 174
+// the pow length is 178
+const POW_LENGTH = 178
 
-//except pow type 4bytes and nonce 8 bytes 176 bytes
+// proof data length is 169
 const PROOFDATA_LENGTH = 169
 
 type PowType byte
@@ -28,6 +28,8 @@ const (
 	X16RV3           PowType = 4
 	X8R16            PowType = 5
 	QITMEERKECCAK256 PowType = 6
+	CRYPTONIGHT      PowType = 7
+	MEERXKECCAKV1    PowType = 8
 )
 
 var PowMapString = map[PowType]interface{}{
@@ -38,6 +40,16 @@ var PowMapString = map[PowType]interface{}{
 	X16RV3:           "x16rv3",
 	X8R16:            "x8r16",
 	QITMEERKECCAK256: "qitmeer_keccak256",
+	CRYPTONIGHT:      "cryptonight",
+	MEERXKECCAKV1:    "meer_xkeccak_v1",
+}
+
+func GetPowName(powType PowType) string {
+	val, ok := PowMapString[powType]
+	if !ok {
+		return ""
+	}
+	return val.(string)
 }
 
 type ProofDataType [PROOFDATA_LENGTH]byte
@@ -54,10 +66,10 @@ type IPow interface {
 	// verify result difficulty
 	Verify(headerData []byte, blockHash hash.Hash, targetDiff uint32) error
 	//set header nonce
-	SetNonce(nonce uint32)
+	SetNonce(nonce uint64)
 	//calc next diff
 	GetNextDiffBig(weightedSumDiv *big.Int, oldDiffBig *big.Int, currentPowPercent *big.Int) *big.Int
-	GetNonce() uint32
+	GetNonce() uint64
 	GetPowType() PowType
 	//set pow type
 	SetPowType(powType PowType)
@@ -76,21 +88,22 @@ type IPow interface {
 	//SetParams
 	SetParams(params *PowConfig)
 	//SetHeight
-	SetMainHeight(height int64)
+	SetMainHeight(height MainHeight)
 	CheckAvailable() bool
 	CompareDiff(newtarget *big.Int, target *big.Int) bool
+	FindSolver(headerData []byte, blockHash hash.Hash, targetDiffBits uint32) bool
 }
 
 type Pow struct {
 	PowType    PowType       //header pow type 1 bytes
-	Nonce      uint32        //header nonce 4 bytes
+	Nonce      uint64        //header nonce 4 bytes
 	ProofData  ProofDataType // 1 edge_bits  168  bytes circle length total 169 bytes
 	params     *PowConfig
-	mainHeight int64
+	mainHeight MainHeight
 }
 
 //get pow instance
-func GetInstance(powType PowType, nonce uint32, proofData []byte) IPow {
+func GetInstance(powType PowType, nonce uint64, proofData []byte) IPow {
 	var instance IPow
 	switch powType {
 	case BLAKE2BD:
@@ -107,6 +120,10 @@ func GetInstance(powType PowType, nonce uint32, proofData []byte) IPow {
 		instance = &Cuckaroom{}
 	case CUCKATOO:
 		instance = &Cuckatoo{}
+	case CRYPTONIGHT:
+		instance = &CryptoNight{}
+	case MEERXKECCAKV1:
+		instance = &MeerXKeccakV1{}
 	default:
 		instance = &Blake2bd{}
 	}
@@ -124,7 +141,7 @@ func (this *Pow) SetParams(params *PowConfig) {
 	this.params = GetPowConfig().Set(params)
 }
 
-func (this *Pow) SetMainHeight(mainHeight int64) {
+func (this *Pow) SetMainHeight(mainHeight MainHeight) {
 	this.mainHeight = mainHeight
 }
 
@@ -132,11 +149,11 @@ func (this *Pow) GetPowType() PowType {
 	return this.PowType
 }
 
-func (this *Pow) GetNonce() uint32 {
+func (this *Pow) GetNonce() uint64 {
 	return this.Nonce
 }
 
-func (this *Pow) SetNonce(nonce uint32) {
+func (this *Pow) SetNonce(nonce uint64) {
 	this.Nonce = nonce
 }
 
@@ -148,4 +165,15 @@ func (this *Pow) GetProofData() string {
 func (this *Pow) SetProofData(data []byte) {
 	l := len(data)
 	copy(this.ProofData[0:l], data[:])
+}
+
+func (this *Pow) PowPercent() *big.Int {
+	targetPercent := big.NewInt(int64(this.params.GetPercentByHeightAndType(this.mainHeight, this.GetPowType())))
+	targetPercent.Lsh(targetPercent, 32)
+	return targetPercent
+}
+
+//check pow is available
+func (this *Pow) CheckAvailable() bool {
+	return this.params.GetPercentByHeightAndType(this.mainHeight, this.PowType) > 0
 }

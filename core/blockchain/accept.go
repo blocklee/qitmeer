@@ -8,9 +8,12 @@ package blockchain
 
 import (
 	"fmt"
+	"github.com/Qitmeer/qitmeer/core/blockchain/token"
+	"github.com/Qitmeer/qitmeer/core/blockdag"
 	"github.com/Qitmeer/qitmeer/core/types"
 	"github.com/Qitmeer/qitmeer/database"
 	"github.com/Qitmeer/qitmeer/engine/txscript"
+	"github.com/Qitmeer/qitmeer/params"
 	"math"
 	"time"
 )
@@ -84,31 +87,16 @@ func (b *BlockChain) maybeAcceptBlock(block *types.SerializedBlock, flags Behavi
 	// This function should never be called with orphan blocks or the
 	// genesis block.
 	b.ChainLock()
-	defer b.ChainUnlock()
+	defer func() {
+		b.ChainUnlock()
+		b.flushNotifications()
+	}()
 
-	parentsNode := []*blockNode{}
-	for _, pb := range block.Block().Parents {
-		prevHash := pb
-		prevNode := b.index.LookupNode(prevHash)
-		if prevNode == nil {
-			err := fmt.Errorf("Parents block %s is unknown", prevHash)
-			log.Debug(err.Error())
-			return err
-		}
-		parentsNode = append(parentsNode, prevNode)
-	}
-
-	blockHeader := &block.Block().Header
-	newNode := newBlockNode(blockHeader, parentsNode)
-	mainParent := newNode.GetMainParent(b)
+	newNode := NewBlockNode(block, block.Block().Parents)
+	mainParent := b.bd.GetMainParentByHashs(block.Block().Parents)
 	if mainParent == nil {
-		return fmt.Errorf("Can't find main parent")
+		return fmt.Errorf("Can't find main parent\n")
 	}
-
-	newNode.CalcWorkSum(b.index.LookupNode(mainParent.GetHash()))
-	newNode.SetHeight(mainParent.GetHeight() + 1)
-
-	block.SetHeight(newNode.GetHeight())
 	// The block must pass all of the validation rules which depend on the
 	// position of the block within the block chain.
 	err := b.checkBlockContext(block, mainParent, flags)
@@ -121,27 +109,13 @@ func (b *BlockChain) maybeAcceptBlock(block *types.SerializedBlock, flags Behavi
 	b.pruner.pruneChainIfNeeded()
 
 	//dag
-	newOrders, ib := b.bd.AddBlock(newNode)
+	newOrders, oldOrders, ib, isMainChainTipChange := b.bd.AddBlock(newNode)
 	if newOrders == nil || newOrders.Len() == 0 || ib == nil {
-		return fmt.Errorf("Irreparable error![%s]", newNode.hash.String())
+		return fmt.Errorf("Irreparable error![%s]\n", newNode.GetHash().String())
 	}
-	newNode.dagID = ib.GetID()
-	newNode.SetLayer(ib.GetLayer())
 	block.SetOrder(uint64(ib.GetOrder()))
-	if ib.GetHeight() != newNode.GetHeight() {
-		log.Warn(fmt.Sprintf("The consensus main height is not match (%s) %d-%d", newNode.GetHash(), newNode.GetHeight(), ib.GetHeight()))
-		newNode.SetHeight(ib.GetHeight())
-		block.SetHeight(ib.GetHeight())
-	}
+	block.SetHeight(ib.GetHeight())
 
-	oldOrders := BlockNodeList{}
-	b.getReorganizeNodes(newNode, block, newOrders, &oldOrders)
-	b.index.AddNode(newNode)
-	newNode.SetStatusFlags(statusDataStored)
-	err = newNode.FlushToDB(b)
-	if err != nil {
-		panic(err.Error())
-	}
 	// Insert the block into the database if it's not already there.  Even
 	// though it is possible the block will ultimately fail to connect, it
 	// has already passed all proof-of-work and validity tests which means
@@ -154,7 +128,18 @@ func (b *BlockChain) maybeAcceptBlock(block *types.SerializedBlock, flags Behavi
 	//
 	// Also, store the associated block index entry.
 	err = b.db.Update(func(dbTx database.Tx) error {
-		if err := dbMaybeStoreBlock(dbTx, block); err != nil {
+		exists, err := dbTx.HasBlock(block.Hash())
+		if err != nil {
+			return err
+		}
+		if exists {
+			return nil
+		}
+		err = dbMaybeStoreBlock(dbTx, block)
+		if err != nil {
+			if database.IsError(err, database.ErrBlockExists) {
+				return nil
+			}
 			return err
 		}
 		return nil
@@ -162,79 +147,63 @@ func (b *BlockChain) maybeAcceptBlock(block *types.SerializedBlock, flags Behavi
 	if err != nil {
 		panic(err.Error())
 	}
-
 	// Connect the passed block to the chain while respecting proper chain
 	// selection according to the chain with the most proof of work.  This
 	// also handles validation of the transaction scripts.
-	_, err = b.connectDagChain(newNode, block, newOrders, oldOrders)
+	_, err = b.connectDagChain(ib, block, newOrders, oldOrders)
 	if err != nil {
 		log.Warn(fmt.Sprintf("%s", err))
 	}
-	b.updateBestState(newNode, block, newOrders)
 
+	err = b.updateBestState(ib, block, newOrders)
+	if err != nil {
+		panic(err.Error())
+	}
+	b.ChainUnlock()
 	// Notify the caller that the new block was accepted into the block
 	// chain.  The caller would typically want to react by relaying the
 	// inventory to other peers.
-	//TODO, refactor to event subscript/publish
 	b.sendNotification(BlockAccepted, &BlockAcceptedNotifyData{
-		ForkLen: 0,
-		Block:   block,
-		Flags:   flags,
+		IsMainChainTipChange: isMainChainTipChange,
+		Block:                block,
+		Flags:                flags,
 	})
+	b.ChainLock()
 	return nil
 }
 
-func (b *BlockChain) FastAcceptBlock(block *types.SerializedBlock) error {
+func (b *BlockChain) FastAcceptBlock(block *types.SerializedBlock, flags BehaviorFlags) error {
 	b.ChainLock()
-	defer b.ChainUnlock()
+	defer func() {
+		b.ChainUnlock()
+		b.flushNotifications()
+	}()
 
-	parentsNode := []*blockNode{}
-	for _, pb := range block.Block().Parents {
-		prevHash := pb
-		prevNode := b.index.LookupNode(prevHash)
-		if prevNode == nil {
-			err := fmt.Errorf("Parents block %s is unknown", prevHash)
-			log.Debug(err.Error())
+	newNode := NewBlockNode(block, block.Block().Parents)
+
+	fastAdd := flags&BFFastAdd == BFFastAdd
+	if !fastAdd {
+		mainParent := b.bd.GetMainParentByHashs(block.Block().Parents)
+		if mainParent == nil {
+			return fmt.Errorf("Can't find main parent\n")
+		}
+		// The block must pass all of the validation rules which depend on the
+		// position of the block within the block chain.
+		err := b.checkBlockContext(block, mainParent, flags)
+		if err != nil {
 			return err
 		}
-		parentsNode = append(parentsNode, prevNode)
 	}
-
-	blockHeader := &block.Block().Header
-	newNode := newBlockNode(blockHeader, parentsNode)
-	mainParent := newNode.GetMainParent(b)
-	if mainParent == nil {
-		return fmt.Errorf("Can't find main parent")
-	}
-
-	newNode.CalcWorkSum(b.index.LookupNode(mainParent.GetHash()))
-	newNode.SetHeight(mainParent.GetHeight() + 1)
-
-	block.SetHeight(newNode.GetHeight())
-
 	//dag
-	newOrders, ib := b.bd.AddBlock(newNode)
+	newOrders, oldOrders, ib, _ := b.bd.AddBlock(newNode)
 	if newOrders == nil || newOrders.Len() == 0 || ib == nil {
-		return fmt.Errorf("Irreparable error![%s]", newNode.hash.String())
-	}
-	newNode.dagID = ib.GetID()
-	newNode.SetLayer(ib.GetLayer())
-	block.SetOrder(uint64(ib.GetOrder()))
-	if ib.GetHeight() != newNode.GetHeight() {
-		log.Warn(fmt.Sprintf("The consensus main height is not match (%s) %d-%d", newNode.GetHash(), newNode.GetHeight(), ib.GetHeight()))
-		newNode.SetHeight(ib.GetHeight())
-		block.SetHeight(ib.GetHeight())
+		return fmt.Errorf("Irreparable error![%s]\n", newNode.GetHash().String())
 	}
 
-	oldOrders := BlockNodeList{}
-	b.getReorganizeNodes(newNode, block, newOrders, &oldOrders)
-	b.index.AddNode(newNode)
-	newNode.SetStatusFlags(statusDataStored)
-	err := newNode.FlushToDB(b)
-	if err != nil {
-		return err
-	}
-	err = b.db.Update(func(dbTx database.Tx) error {
+	block.SetOrder(uint64(ib.GetOrder()))
+	block.SetHeight(ib.GetHeight())
+
+	err := b.db.Update(func(dbTx database.Tx) error {
 		if err := dbMaybeStoreBlock(dbTx, block); err != nil {
 			return err
 		}
@@ -244,11 +213,149 @@ func (b *BlockChain) FastAcceptBlock(block *types.SerializedBlock) error {
 		return err
 	}
 
-	_, err = b.connectDagChain(newNode, block, newOrders, oldOrders)
+	_, err = b.connectDagChain(ib, block, newOrders, oldOrders)
 	if err != nil {
 		log.Warn(fmt.Sprintf("%s", err))
 	}
-	b.updateBestState(newNode, block, newOrders)
 
-	return nil
+	return b.updateBestState(ib, block, newOrders)
+}
+
+func (b *BlockChain) updateTokenState(node blockdag.IBlock, block *types.SerializedBlock, rollback bool) error {
+	if rollback {
+		if uint32(node.GetID()) == b.TokenTipID {
+			state := b.GetTokenState(b.TokenTipID)
+			if state != nil {
+				err := b.db.Update(func(dbTx database.Tx) error {
+					return token.DBRemoveTokenState(dbTx, uint32(node.GetID()))
+				})
+				if err != nil {
+					return err
+				}
+				b.TokenTipID = state.PrevStateID
+			}
+
+		}
+		return nil
+	}
+	updates := []token.ITokenUpdate{}
+	for _, tx := range block.Transactions() {
+		if tx.IsDuplicate {
+			log.Trace(fmt.Sprintf("updateTokenBalance skip duplicate tx %v", tx.Hash()))
+			continue
+		}
+
+		if types.IsTokenTx(tx.Tx) {
+			update, err := token.NewUpdateFromTx(tx.Tx)
+			if err != nil {
+				return err
+			}
+			updates = append(updates, update)
+		}
+	}
+	if len(updates) <= 0 {
+		return nil
+	}
+	state := b.GetTokenState(b.TokenTipID)
+	if state == nil {
+		state = &token.TokenState{PrevStateID: uint32(blockdag.MaxId), Updates: updates}
+	} else {
+		state.PrevStateID = b.TokenTipID
+		state.Updates = updates
+	}
+
+	err := state.Update()
+	if err != nil {
+		return err
+	}
+
+	err = b.db.Update(func(dbTx database.Tx) error {
+		return token.DBPutTokenState(dbTx, uint32(node.GetID()), state)
+	})
+	if err != nil {
+		return err
+	}
+	b.TokenTipID = uint32(node.GetID())
+	return state.Commit()
+}
+
+func (b *BlockChain) GetTokenState(bid uint32) *token.TokenState {
+	var state *token.TokenState
+	err := b.db.View(func(dbTx database.Tx) error {
+		ts, err := token.DBFetchTokenState(dbTx, bid)
+		if err != nil {
+			return err
+		}
+		state = ts
+		return nil
+	})
+	if err != nil {
+		log.Error(err.Error())
+		return nil
+	}
+	return state
+}
+
+func (b *BlockChain) GetCurTokenState() *token.TokenState {
+	b.ChainRLock()
+	defer b.ChainRUnlock()
+	return b.GetTokenState(b.TokenTipID)
+}
+
+func (b *BlockChain) GetCurTokenOwners(coinId types.CoinID) ([]byte, error) {
+	b.ChainRLock()
+	defer b.ChainRUnlock()
+	state := b.GetTokenState(b.TokenTipID)
+	if state == nil {
+		return nil, fmt.Errorf("Token state error\n")
+	}
+	tt, ok := state.Types[coinId]
+	if !ok {
+		return nil, fmt.Errorf("It doesn't exist: Coin id (%d)\n", coinId)
+	}
+	return tt.Owners, nil
+}
+
+func (b *BlockChain) CheckTokenState(block *types.SerializedBlock) error {
+	updates := []token.ITokenUpdate{}
+	for _, tx := range block.Transactions() {
+		if tx.IsDuplicate {
+			log.Trace(fmt.Sprintf("updateTokenBalance skip duplicate tx %v", tx.Hash()))
+			continue
+		}
+
+		if types.IsTokenTx(tx.Tx) {
+			update, err := token.NewUpdateFromTx(tx.Tx)
+			if err != nil {
+				return err
+			}
+			updates = append(updates, update)
+		}
+	}
+	if len(updates) <= 0 {
+		return nil
+	}
+	state := b.GetTokenState(b.TokenTipID)
+	if state == nil {
+		state = &token.TokenState{PrevStateID: uint32(blockdag.MaxId), Updates: updates}
+	} else {
+		state.PrevStateID = b.TokenTipID
+		state.Updates = updates
+	}
+	return state.Update()
+}
+
+func (b *BlockChain) IsValidTxType(tt types.TxType) bool {
+	txTypesCfg := types.StdTxs
+	ok, err := b.isDeploymentActive(params.DeploymentToken)
+	if err == nil && ok && len(types.NonStdTxs) > 0 {
+		txTypesCfg = append(txTypesCfg, types.NonStdTxs...)
+	}
+
+	for _, txt := range txTypesCfg {
+		if txt == tt {
+			return true
+		}
+	}
+	return false
 }

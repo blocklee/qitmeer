@@ -9,7 +9,6 @@ import (
 	"github.com/Qitmeer/qitmeer/common/encode/base58"
 	"github.com/Qitmeer/qitmeer/common/hash"
 	"github.com/Qitmeer/qitmeer/common/util"
-	"github.com/pkg/errors"
 	"strconv"
 )
 
@@ -21,7 +20,7 @@ func Base58CheckEncode(version []byte, mode string, hasher string, cksumSize int
 	if err != nil {
 		ErrExit(err)
 	}
-	var encoded string
+	var encoded []byte
 
 	if hasher != "" {
 		var cksumfunc func([]byte) []byte
@@ -42,28 +41,32 @@ func Base58CheckEncode(version []byte, mode string, hasher string, cksumSize int
 		if err != nil {
 			ErrExit(err)
 		}
-		encoded = base58.CheckEncode(data, version, cksumSize, cksumfunc)
+		encoded, err = base58.CheckEncode(data, version, cksumSize, cksumfunc)
 	} else {
 		switch mode {
 		case "qitmeer":
 			if len(version) != 2 {
 				ErrExit(fmt.Errorf("invaid version byte size for qitmeer base58 check encode. input = %x (len = %d, required 2)", version, len(version)))
 			}
-			encoded = base58.QitmeerCheckEncode(data, version[:])
+			encoded, err = base58.QitmeerCheckEncode(data, version[:])
 		case "btc":
 			if len(version) > 1 {
 				ErrExit(fmt.Errorf("invaid version size for btc base58check encode"))
 			}
-			encoded = base58.BtcCheckEncode(data, version[0])
+			encoded, err = base58.BtcCheckEncode(data, version[0])
 		case "ss":
-			encoded = base58.CheckEncode(data, version[:], 2, base58.SingleHashChecksumFunc(hash.GetHasher(hash.Blake2b_512), 2))
+			encoded, err = base58.CheckEncode(data, version[:], 2, base58.SingleHashChecksumFunc(hash.GetHasher(hash.Blake2b_512), 2))
 		default:
 			ErrExit(fmt.Errorf("unknown encode mode %s", mode))
 		}
 	}
 	// Show the encoded data.
 	//fmt.Printf("Encoded Data ver[%v] : %s\n",ver, encoded)
-	fmt.Printf("%s\n", encoded)
+	if err != nil {
+		ErrExit(err)
+	} else {
+		fmt.Printf("%s\n", encoded)
+	}
 }
 
 func Base58CheckDecode(mode, hasher string, versionSize, cksumSize int, input string, showDetails bool) {
@@ -77,15 +80,15 @@ func Base58CheckDecode(mode, hasher string, versionSize, cksumSize int, input st
 		var v []byte
 		switch hasher {
 		case "sha256":
-			data, v, err = base58.CheckDecode(input, versionSize, cksumSize, base58.SingleHashChecksumFunc(hash.GetHasher(hash.SHA256), cksumSize))
+			data, v, err = base58.CheckDecode([]byte(input), versionSize, cksumSize, base58.SingleHashChecksumFunc(hash.GetHasher(hash.SHA256), cksumSize))
 		case "dsha256":
-			data, v, err = base58.CheckDecode(input, versionSize, cksumSize, base58.DoubleHashChecksumFunc(hash.GetHasher(hash.SHA256), cksumSize))
+			data, v, err = base58.CheckDecode([]byte(input), versionSize, cksumSize, base58.DoubleHashChecksumFunc(hash.GetHasher(hash.SHA256), cksumSize))
 		case "blake2b256":
-			data, v, err = base58.CheckDecode(input, versionSize, cksumSize, base58.SingleHashChecksumFunc(hash.GetHasher(hash.Blake2b_256), cksumSize))
+			data, v, err = base58.CheckDecode([]byte(input), versionSize, cksumSize, base58.SingleHashChecksumFunc(hash.GetHasher(hash.Blake2b_256), cksumSize))
 		case "dblake2b256":
-			data, v, err = base58.CheckDecode(input, versionSize, cksumSize, base58.DoubleHashChecksumFunc(hash.GetHasher(hash.Blake2b_256), cksumSize))
+			data, v, err = base58.CheckDecode([]byte(input), versionSize, cksumSize, base58.DoubleHashChecksumFunc(hash.GetHasher(hash.Blake2b_256), cksumSize))
 		case "blake2b512":
-			data, v, err = base58.CheckDecode(input, versionSize, cksumSize, base58.SingleHashChecksumFunc(hash.GetHasher(hash.Blake2b_512), cksumSize))
+			data, v, err = base58.CheckDecode([]byte(input), versionSize, cksumSize, base58.SingleHashChecksumFunc(hash.GetHasher(hash.Blake2b_512), cksumSize))
 		default:
 			err = fmt.Errorf("unknown hasher %s", hasher)
 		}
@@ -111,7 +114,7 @@ func Base58CheckDecode(mode, hasher string, versionSize, cksumSize int, input st
 			version = []byte{v[0], v[1]}
 		case "ss":
 			var v []byte
-			data, v, err = base58.CheckDecode(input, 1, 2, base58.SingleHashChecksumFunc(hash.GetHasher(hash.Blake2b_512), 2))
+			data, v, err = base58.CheckDecode([]byte(input), 1, 2, base58.SingleHashChecksumFunc(hash.GetHasher(hash.Blake2b_512), 2))
 			if err != nil {
 				ErrExit(err)
 			}
@@ -121,30 +124,36 @@ func Base58CheckDecode(mode, hasher string, versionSize, cksumSize int, input st
 		}
 	}
 	if showDetails {
-		decoded := base58.Decode(input)
+		decoded := base58.Decode([]byte(input))
 		if hasher != "" {
 			fmt.Printf("hasher  : %s\n", hasher)
 		} else {
 			fmt.Printf("mode    : %s\n", mode)
 		}
 		version_d, err := strconv.ParseUint(fmt.Sprintf("%x", version[:]), 16, 64)
+		if err != nil {
+			ErrExit(err)
+		}
 		version_r := util.CopyBytes(version[:])
 		util.ReverseBytes(version_r)
 		version_d2, err := strconv.ParseUint(fmt.Sprintf("%x", version_r[:]), 16, 64)
 		if err != nil {
-			ErrExit(errors.Wrapf(err, "convert version %x error", version[:]))
+			ErrExit(fmt.Errorf("convert version %x error : %w", version[:], err))
 		}
 		fmt.Printf("version : %x (hex) %v (BE) %v (LE)\n", version, version_d, version_d2)
 		fmt.Printf("payload : %x\n", data)
 		cksum := decoded[len(decoded)-cksumSize:]
 		cksum_d, err := strconv.ParseUint(fmt.Sprintf("%x", cksum[:]), 16, 64)
 		if err != nil {
-			ErrExit(errors.Wrapf(err, "convert version %x error", cksum[:]))
+			ErrExit(fmt.Errorf("convert version %x error : %w", cksum[:], err))
 		}
 		//convere to  little endian
 		cksum_r := util.CopyBytes(cksum[:])
 		util.ReverseBytes(cksum_r)
 		cksum_d2, err := strconv.ParseUint(fmt.Sprintf("%x", cksum_r[:]), 16, 64)
+		if err != nil {
+			ErrExit(err)
+		}
 		fmt.Printf("checksum: %x (hex) %v (BE) %v (LE)\n", cksum, cksum_d, cksum_d2)
 
 	} else {
@@ -157,11 +166,11 @@ func Base58Encode(input string) {
 	if err != nil {
 		ErrExit(err)
 	}
-	encoded := base58.Encode(data)
+	encoded, _ := base58.Encode(data)
 	fmt.Printf("%s\n", encoded)
 }
 
 func Base58Decode(input string) {
-	data := base58.Decode(input)
+	data := base58.Decode([]byte(input))
 	fmt.Printf("%x\n", data)
 }

@@ -21,8 +21,8 @@ type DAGSync struct {
 
 	// The following fields are used to track the graph state being synced to from
 	// peers.
-	GSMtx sync.Mutex
-	GS    *GraphState
+	gsMtx sync.Mutex
+	gs    *GraphState
 }
 
 // CalcSyncBlocks
@@ -53,6 +53,18 @@ func (ds *DAGSync) CalcSyncBlocks(gs *GraphState, locator []*hash.Hash, mode Syn
 
 	if point == nil && len(locator) > 0 {
 		point = ds.bd.getBlock(locator[0])
+		if point != nil {
+			for !ds.bd.isOnMainChain(point.GetID()) {
+				if point.GetMainParent() == MaxId {
+					break
+				}
+				point = ds.bd.getBlockById(point.GetMainParent())
+				if point == nil {
+					break
+				}
+			}
+		}
+
 	}
 
 	if point == nil {
@@ -154,6 +166,9 @@ func (ds *DAGSync) GetMainLocator(point *hash.Hash) []*hash.Hash {
 		tempL := locator
 		locator = []*hash.Hash{}
 		for i := len(tempL) - 1; i >= 0; i-- {
+			if len(locator) >= MaxMainLocatorNum {
+				break
+			}
 			locator = append(locator, tempL[i])
 		}
 	}
@@ -165,16 +180,23 @@ func (ds *DAGSync) getBlockChainFromMain(point IBlock, maxHashes uint) []*hash.H
 	mainTip := ds.bd.getMainChainTip()
 	result := []*hash.Hash{}
 	for i := point.GetOrder() + 1; i <= mainTip.GetOrder(); i++ {
-		block := ds.bd.instance.GetBlockByOrder(i)
+		block := ds.bd.getBlockByOrder(i)
 		if block == nil {
 			continue
 		}
-		result = append(result, block)
+		result = append(result, block.GetHash())
 		if uint(len(result)) >= maxHashes {
 			break
 		}
 	}
 	return result
+}
+
+func (ds *DAGSync) SetGraphState(gs *GraphState) {
+	ds.gsMtx.Lock()
+	defer ds.gsMtx.Unlock()
+
+	ds.gs = gs
 }
 
 // NewDAGSync

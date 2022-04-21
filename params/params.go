@@ -12,6 +12,8 @@ import (
 	"github.com/Qitmeer/qitmeer/core/protocol"
 	"github.com/Qitmeer/qitmeer/core/types"
 	"github.com/Qitmeer/qitmeer/core/types/pow"
+	"github.com/Qitmeer/qitmeer/ledger"
+	"strings"
 	"time"
 )
 
@@ -49,31 +51,58 @@ type Checkpoint struct {
 	Hash  *hash.Hash
 }
 
-// DNSSeed identifies a DNS seed.
-type DNSSeed struct {
-	// Host defines the hostname of the seed.
-	Host string
-
-	// HasFiltering defines whether the seed supports filtering
-	// by service flags (wire.ServiceFlag).
-	HasFiltering bool
-}
+const (
+	CoinbaseVersionV1 = "0.10.4"
+)
 
 // ConsensusDeployment defines details related to a specific consensus rule
-// change that is voted in.  This is part of BIP0009.
+// change that is voted in.
+// NOTE: The type of time must be consistent
 type ConsensusDeployment struct {
 	// BitNumber defines the specific bit number within the block version
 	// this particular soft-fork deployment refers to.
 	BitNumber uint8
 
-	// StartTime is the median block time after which voting on the
-	// deployment starts.
+	// StartTime (>=CheckerTimeThreshold) is the median block time after which voting on the
+	// deployment starts .
+	// or
+	// StartTime (< CheckerTimeThreshold) is the block main height after which voting on the
+	// deployment starts .
 	StartTime uint64
 
-	// ExpireTime is the median block time after which the attempted
+	// ExpireTime (>=CheckerTimeThreshold) is the median block time after which the attempted
+	// deployment expires.
+	// or
+	// ExpireTime (< CheckerTimeThreshold) is the block main height after which the attempted
 	// deployment expires.
 	ExpireTime uint64
+
+	// PerformTime (>=CheckerTimeThreshold) is the median block time after which the attempted
+	// deployment perform.
+	// or
+	// PerformTime (< CheckerTimeThreshold) is the block main height after which the attempted
+	// deployment perform.
+	PerformTime uint64
 }
+
+// Constants that define the deployment offset in the deployments field of the
+// parameters for each deployment.  This is useful to be able to get the details
+// of a specific deployment by name.
+const (
+	// DeploymentTestDummy defines the rule change deployment ID for testing
+	// purposes.
+	DeploymentTestDummy = iota
+
+	// DeploymentToken defines the rule change deployment ID for the token
+	// soft-fork package.
+	DeploymentToken
+
+	// NOTE: DefinedDeployments must always come last since it is used to
+	// determine how many defined deployments there currently are.
+
+	// DefinedDeployments is the number of currently defined deployments.
+	DefinedDeployments
+)
 
 // Params defines a qitmeer network by its parameters.  These parameters may be
 // used by qitmeer applications to differentiate networks as well as addresses
@@ -85,12 +114,15 @@ type Params struct {
 	// Net defines the magic bytes used to identify the network.
 	Net protocol.Network
 
-	// DefaultPort defines the default peer-to-peer port for the network.
+	// TCPPort defines the default peer-to-peer tcp port for the network.
 	DefaultPort string
 
-	// DNSSeeds defines a list of DNS seeds for the network that are used
+	// DefaultUDPPort defines the default peer-to-peer udp port for the network.
+	DefaultUDPPort int
+
+	// Bootstrap defines a list of boot node for the network that are used
 	// as one method to discover peers.
-	DNSSeeds []DNSSeed
+	Bootstrap []string
 
 	// GenesisBlock defines the first block of the chain.
 	GenesisBlock *types.Block
@@ -180,6 +212,9 @@ type Params struct {
 	// SubsidyReductionInterval is the reduction interval in blocks.
 	SubsidyReductionInterval int64
 
+	// TargetTotalSubsidy is the target total subsidy.
+	TargetTotalSubsidy int64
+
 	// WorkRewardProportion is the comparative amount of the subsidy given for
 	// creating a block.
 	WorkRewardProportion uint16
@@ -213,7 +248,7 @@ type Params struct {
 	// on.
 	RuleChangeActivationThreshold uint32
 	MinerConfirmationWindow       uint32
-	Deployments                   map[uint32][]ConsensusDeployment
+	Deployments                   []ConsensusDeployment
 
 	// Mempool parameters
 	RelayNonStdTxs bool
@@ -245,10 +280,57 @@ type Params struct {
 	// TODO revisit the org-pkscript design
 	OrganizationPkScript []byte
 
-	//DAG
+	// TokenAdminPkScript is the output script for token
+	// It should ideally be a P2SH multisignature address.
+	TokenAdminPkScript []byte
+
+	// the output script for guard lock address
+	GuardAddrPkScript []byte
+	// the output script for honor lock address
+	HonorAddrPkScript []byte
+
+	// DAG
 	BlockDelay    float64
 	BlockRate     float64
 	SecurityLevel float64
+
+	LedgerParams ledger.LedgerParams
+
+	CoinbaseConfig CoinbaseConfigs
+}
+
+type CoinbaseConfig struct {
+	Height                    int64
+	Version                   string
+	ExtraDataIncludedVer      bool
+	ExtraDataIncludedNodeInfo bool
+}
+
+type CoinbaseConfigs []CoinbaseConfig
+
+func (cf *CoinbaseConfigs) CheckVersion(curHeight int64, coinbase []byte) bool {
+	version := cf.GetCurrentVersion(curHeight)
+	return version == "" || strings.Contains(string(coinbase), version)
+}
+
+func (cf *CoinbaseConfigs) GetCurrentVersion(curHeight int64) string {
+	current := cf.GetCurrentConfig(curHeight)
+	if current != nil && current.ExtraDataIncludedVer {
+		return current.Version
+	}
+	return ""
+}
+
+func (cf *CoinbaseConfigs) GetCurrentConfig(curHeight int64) *CoinbaseConfig {
+	var cc *CoinbaseConfig = nil
+	for i := 0; i < len(*cf); i++ {
+		config := (*cf)[i]
+		if config.Height > curHeight {
+			break
+		}
+		cc = &config
+	}
+	return cc
 }
 
 // TotalSubsidyProportions is the sum of POW Reward, POS Reward, and Tax
@@ -284,11 +366,6 @@ var (
 	scriptHashAddrIDs = make(map[[2]byte]struct{})
 	hdPrivToPubKeyIDs = make(map[[4]byte][]byte)
 )
-
-// String returns the hostname of the DNS seed in human-readable form.
-func (d DNSSeed) String() string {
-	return d.Host
-}
 
 // Register registers the network parameters for a Bitcoin network.  This may
 // error with ErrDuplicateNet if the network is already registered (either

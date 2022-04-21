@@ -8,8 +8,6 @@ import (
 	_ "github.com/Qitmeer/qitmeer/database/ffldb"
 	"github.com/Qitmeer/qitmeer/log"
 	"github.com/Qitmeer/qitmeer/params"
-	"github.com/Qitmeer/qitmeer/services/common"
-	"github.com/Qitmeer/qitmeer/services/mining"
 	"os"
 )
 
@@ -23,8 +21,8 @@ func main() {
 	}
 
 	defer func() {
-		if common.LogWrite() != nil {
-			common.LogWrite().Close()
+		if log.LogWrite() != nil {
+			log.LogWrite().Close()
 		}
 	}()
 
@@ -42,11 +40,10 @@ func main() {
 
 	// find
 	bc, err := blockchain.New(&blockchain.Config{
-		DB:           db,
-		ChainParams:  params.ActiveNetParams.Params,
-		TimeSource:   blockchain.NewMedianTime(),
-		DAGType:      cfg.DAGType,
-		BlockVersion: mining.BlockVersion(params.ActiveNetParams.Params.Net),
+		DB:          db,
+		ChainParams: params.ActiveNetParams.Params,
+		TimeSource:  blockchain.NewMedianTime(),
+		DAGType:     cfg.DAGType,
 	})
 	if err != nil {
 		log.Error(err.Error())
@@ -176,7 +173,7 @@ func processIsCheckpoint(chain *blockchain.BlockChain, cfg *Config) bool {
 		log.Error(err.Error())
 		return true
 	}
-	block := chain.BlockDAG().GetBlock(blockhash)
+	block := chain.GetBlock(blockhash)
 	if block == nil {
 		log.Error(fmt.Sprintf("%s is not check point", blockhash.String()))
 		return true

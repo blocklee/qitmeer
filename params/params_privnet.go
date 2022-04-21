@@ -10,6 +10,7 @@ import (
 	"github.com/Qitmeer/qitmeer/common"
 	"github.com/Qitmeer/qitmeer/core/protocol"
 	"github.com/Qitmeer/qitmeer/core/types/pow"
+	"github.com/Qitmeer/qitmeer/ledger"
 	"math/big"
 	"time"
 )
@@ -29,14 +30,19 @@ const privTargetTimePerBlock = 30
 // following normal discovery rules.  This is important as otherwise it would
 // just turn into another public testnet.
 var PrivNetParams = Params{
-	Name:        "privnet",
-	Net:         protocol.PrivNet,
-	DefaultPort: "38130",
-	DNSSeeds:    []DNSSeed{}, // NOTE: There must NOT be any seeds.
+	Name:           "privnet",
+	Net:            protocol.PrivNet,
+	DefaultPort:    "38130",
+	DefaultUDPPort: 38140,
+	Bootstrap:      []string{},
 
 	// Chain parameters
 	GenesisBlock: &privNetGenesisBlock,
 	GenesisHash:  &privNetGenesisHash,
+	LedgerParams: ledger.LedgerParams{
+		GenesisAmountUnit: 1000 * 1e8,
+		MaxLockHeight:     10 * 365 * 5,
+	},
 	PowConfig: &pow.PowConfig{
 		Blake2bdPowLimit:             privNetPowLimit,
 		Blake2bdPowLimitBits:         0x207fffff,
@@ -46,6 +52,8 @@ var PrivNetParams = Params{
 		X16rv3PowLimitBits:           0x207fffff,
 		QitmeerKeccak256PowLimit:     privNetPowLimit,
 		QitmeerKeccak256PowLimitBits: 0x207fffff,
+		MeerXKeccakV1PowLimit:        privNetPowLimit,
+		MeerXKeccakV1PowLimitBits:    0x207fffff,
 		//hash ffffffffffffffff000000000000000000000000000000000000000000000000 corresponding difficulty is 48 for edge bits 24
 		// Uniform field type uint64 value is 48 . bigToCompact the uint32 value
 		// 24 edge_bits only need hash 1 times use for privnet if GPS is 2. need 50 /2 = 25s find once
@@ -53,40 +61,56 @@ var PrivNetParams = Params{
 		CuckatooMinDifficulty:  0x1300000,
 		CuckaroomMinDifficulty: 0x1300000,
 
-		Percent: []pow.Percent{
-			{
-				Blake2bDPercent:         10,
-				CuckarooPercent:         10,
-				CuckatooPercent:         20,
-				CuckaroomPercent:        10,
-				X16rv3Percent:           10,
-				X8r16Percent:            20,
-				QitmeerKeccak256Percent: 20,
-				MainHeight:              0,
+		Percent: map[pow.MainHeight]pow.PercentItem{
+			pow.MainHeight(0): {
+				pow.BLAKE2BD:      10,
+				pow.CUCKAROO:      10,
+				pow.CUCKATOO:      20,
+				pow.CUCKAROOM:     10,
+				pow.X16RV3:        10,
+				pow.X8R16:         20,
+				pow.MEERXKECCAKV1: 20,
 			},
-			{
-				Blake2bDPercent:         0,
-				CuckarooPercent:         30,
-				CuckatooPercent:         0,
-				CuckaroomPercent:        30,
-				X16rv3Percent:           10,
-				X8r16Percent:            0,
-				QitmeerKeccak256Percent: 30,
-				MainHeight:              50,
+			pow.MainHeight(50): {
+				pow.BLAKE2BD:         0,
+				pow.CUCKAROO:         30,
+				pow.CUCKATOO:         0,
+				pow.CUCKAROOM:        30,
+				pow.X16RV3:           10,
+				pow.X8R16:            0,
+				pow.QITMEERKECCAK256: 0,
+				pow.MEERXKECCAKV1:    30,
 			},
-			{
-				Blake2bDPercent:         0,
-				CuckarooPercent:         0,
-				CuckatooPercent:         0,
-				CuckaroomPercent:        70,
-				X16rv3Percent:           0,
-				X8r16Percent:            0,
-				QitmeerKeccak256Percent: 30,
-				MainHeight:              100,
+			pow.MainHeight(100): {
+				pow.BLAKE2BD:      0,
+				pow.CUCKAROO:      0,
+				pow.CUCKATOO:      0,
+				pow.CUCKAROOM:     70,
+				pow.X16RV3:        0,
+				pow.X8R16:         0,
+				pow.MEERXKECCAKV1: 30,
 			},
 		},
 		// after this height the big graph will be the main pow graph
 		AdjustmentStartMainHeight: 45 * 1440 * 60 / privTargetTimePerBlock,
+	},
+	CoinbaseConfig: CoinbaseConfigs{
+		{
+			Height:  0,
+			Version: "0.10.1",
+		},
+		{
+			Height:                    10,
+			Version:                   "0.10.2",
+			ExtraDataIncludedVer:      true,
+			ExtraDataIncludedNodeInfo: true,
+		},
+		{
+			Height:                    20,
+			Version:                   "0.10.3",
+			ExtraDataIncludedVer:      true,
+			ExtraDataIncludedNodeInfo: true,
+		},
 	},
 	ReduceMinDifficulty:      false,
 	MinDiffReductionTime:     0, // Does not apply since ReduceMinDifficulty false
@@ -94,7 +118,7 @@ var PrivNetParams = Params{
 	MaximumBlockSizes:        []int{1000000, 1310720},
 	MaxTxSize:                1000000,
 	WorkDiffAlpha:            1,
-	WorkDiffWindowSize:       16,
+	WorkDiffWindowSize:       160,
 	WorkDiffWindows:          20,
 	TargetTimePerBlock:       time.Second * privTargetTimePerBlock,
 	TargetTimespan:           time.Second * privTargetTimePerBlock * 16, // TimePerBlock * WindowSize
@@ -112,17 +136,14 @@ var PrivNetParams = Params{
 	// Checkpoints ordered from oldest to newest.
 	Checkpoints: nil,
 
-	// Consensus rule change deployments.
-	Deployments: map[uint32][]ConsensusDeployment{},
-
 	// Address encoding magics
 	NetworkAddressPrefix: "R",
-	PubKeyAddrID:         [2]byte{0x0d, 0xef}, // starts with Rk
+	PubKeyAddrID:         [2]byte{0x25, 0xe5}, // starts with Rk
 	PubKeyHashAddrID:     [2]byte{0x0d, 0xf1}, // starts with Rm
-	PKHEdwardsAddrID:     [2]byte{0x0d, 0xdf}, // starts with Re
-	PKHSchnorrAddrID:     [2]byte{0x0d, 0xfd}, // starts with Rr
+	PKHEdwardsAddrID:     [2]byte{0x0d, 0xe0}, // starts with Re
+	PKHSchnorrAddrID:     [2]byte{0x0d, 0xfe}, // starts with Rr
 	ScriptHashAddrID:     [2]byte{0x0d, 0xc2}, // starts with RS
-	PrivateKeyID:         [2]byte{0x0c, 0xdd}, // starts with Pr
+	PrivateKeyID:         [2]byte{0x22, 0xfe}, // starts with Pr
 
 	// BIP32 hierarchical deterministic extended key magics
 	HDPrivateKeyID: [4]byte{0x04, 0x0b, 0xee, 0x6e}, // starts with rprv
@@ -133,8 +154,10 @@ var PrivNetParams = Params{
 	// TODO coin type
 	HDCoinType: 223, // ASCII for s
 
-	// TODO replace the test pkh
-	//OrganizationPkScript:  hexMustDecode("76a91408ff3106060bf8d7d61a25d8108ec977698729f788ac"),
+	OrganizationPkScript:  hexMustDecode("76a91429209320e66d96839785dd07e643a7f1592edc5a88ac"),
+
+	// Because it's only for testing, it comes from testwallet.go
+	TokenAdminPkScript: hexMustDecode("00000000c96d6d76a914785bfbf4ecad8b72f2582be83616c5d364a3244288ac"),
 
 	CoinbaseMaturity: 16,
 }

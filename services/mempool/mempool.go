@@ -9,14 +9,19 @@ import (
 	"container/list"
 	"fmt"
 	"github.com/Qitmeer/qitmeer/common/hash"
+	"github.com/Qitmeer/qitmeer/common/roughtime"
 	"github.com/Qitmeer/qitmeer/core/blockchain"
+	"github.com/Qitmeer/qitmeer/core/event"
 	"github.com/Qitmeer/qitmeer/core/message"
 	"github.com/Qitmeer/qitmeer/core/types"
-	"github.com/Qitmeer/qitmeer/log"
 	"math"
 	"sync"
 	"sync/atomic"
 	"time"
+)
+
+const (
+	MempoolTxAdd = int(1)
 )
 
 // TxPool is used as a source of transactions that need to be mined into blocks
@@ -107,7 +112,7 @@ func (mp *TxPool) removeTransaction(theTx *types.Tx, removeRedeemers bool) {
 			delete(mp.outpoints, txIn.PreviousOut)
 		}
 		delete(mp.pool, *txHash)
-		atomic.StoreInt64(&mp.lastUpdated, time.Now().Unix())
+		atomic.StoreInt64(&mp.lastUpdated, roughtime.Now().Unix())
 	}
 }
 
@@ -157,7 +162,7 @@ func (mp *TxPool) addTransaction(utxoView *blockchain.UtxoViewpoint,
 	txD := &TxDesc{
 		TxDesc: types.TxDesc{
 			Tx:       tx,
-			Added:    time.Now(),
+			Added:    roughtime.Now(),
 			Height:   int64(height), //todo: fix type conversion
 			Fee:      fee,
 			FeePerKB: fee * 1000 / int64(tx.Tx.SerializeSize()),
@@ -168,7 +173,7 @@ func (mp *TxPool) addTransaction(utxoView *blockchain.UtxoViewpoint,
 	for _, txIn := range msgTx.TxIn {
 		mp.outpoints[txIn.PreviousOut] = tx
 	}
-	atomic.StoreInt64(&mp.lastUpdated, time.Now().Unix())
+	atomic.StoreInt64(&mp.lastUpdated, roughtime.Now().Unix())
 
 	// Add unconfirmed address index entries associated with the transaction
 	// if enabled.
@@ -178,6 +183,8 @@ func (mp *TxPool) addTransaction(utxoView *blockchain.UtxoViewpoint,
 	if mp.cfg.ExistsAddrIndex != nil {
 		mp.cfg.ExistsAddrIndex.AddUnconfirmedTx(msgTx)
 	}
+
+	go mp.cfg.Events.Send(event.New(MempoolTxAdd))
 	return txD
 }
 
@@ -204,6 +211,10 @@ func (mp *TxPool) maybeAcceptTransaction(tx *types.Tx, isNew, rateLimit, allowHi
 		return nil, nil, txRuleError(message.RejectDuplicate, str)
 	}
 
+	if !mp.cfg.BC.IsValidTxType(types.DetermineTxType(tx.Tx)) {
+		str := fmt.Sprintf("%s is not support transaction type.", types.DetermineTxType(tx.Tx).String())
+		return nil, nil, txRuleError(message.RejectNonstandard, str)
+	}
 	// Perform preliminary sanity checks on the transaction.  This makes
 	// use of chain which contains the invariant rules for what
 	// transactions are allowed into blocks.
@@ -277,6 +288,50 @@ func (mp *TxPool) maybeAcceptTransaction(tx *types.Tx, isNew, rateLimit, allowHi
 		return nil, nil, err
 	}
 
+	if types.IsTokenTx(tx.Tx) {
+		// Verify crypto signatures for each input and reject the transaction if
+		// any don't verify.
+		flags, err := mp.cfg.Policy.StandardVerifyFlags()
+		if err != nil {
+			return nil, nil, err
+		}
+
+		utxoView := blockchain.NewUtxoViewpoint()
+		if types.IsTokenMintTx(tx.Tx) {
+			utxoView, err = mp.fetchInputUtxos(tx)
+			if err != nil {
+				return nil, nil, err
+			}
+			pkscript, err := mp.cfg.BC.GetCurTokenOwners(tx.Tx.TxOut[0].Amount.Id)
+			if err != nil {
+				return nil, nil, err
+			}
+			utxoView.AddTokenTxOut(tx.Tx.TxIn[0].PreviousOut, pkscript)
+
+			err = mp.cfg.BC.CheckTokenTransactionInputs(tx, utxoView)
+			if err != nil {
+				return nil, nil, err
+			}
+		} else {
+			utxoView.AddTokenTxOut(tx.Tx.TxIn[0].PreviousOut, nil)
+		}
+
+		err = blockchain.ValidateTransactionScripts(tx, utxoView, flags,
+			mp.cfg.SigCache)
+		if err != nil {
+			if cerr, ok := err.(blockchain.RuleError); ok {
+				return nil, nil, chainRuleError(cerr)
+			}
+			return nil, nil, err
+		}
+
+		// Add to transaction pool.
+		txD := mp.addTransaction(utxoView, tx, nextBlockHeight, 0)
+
+		log.Debug("Accepted transaction", "txHash", txHash, "pool size", len(mp.pool))
+
+		return nil, txD, nil
+	}
 	// Fetch all of the unspent transaction outputs referenced by the inputs
 	// to this transaction.  This function also attempts to fetch the
 	// transaction itself to be used for detecting a duplicate transaction
@@ -343,7 +398,7 @@ func (mp *TxPool) maybeAcceptTransaction(tx *types.Tx, isNew, rateLimit, allowHi
 	// Also returns the fees associated with the transaction which will be
 	// used later.  The fraud proof is not checked because it will be
 	// filled in by the miner.
-	txFee, err := mp.cfg.BC.CheckTransactionInputs(tx, utxoView) //TODO fix type conversion
+	txFees, err := mp.cfg.BC.CheckTransactionInputs(tx, utxoView) //TODO fix type conversion
 	if err != nil {
 		if cerr, ok := err.(blockchain.RuleError); ok {
 			return nil, nil, chainRuleError(cerr)
@@ -395,12 +450,24 @@ func (mp *TxPool) maybeAcceptTransaction(tx *types.Tx, isNew, rateLimit, allowHi
 
 	// Don't allow transactions with fees too low to get into a mined block.
 	serializedSize := int64(msgTx.SerializeSize())
+
 	minFee := calcMinRequiredTxRelayFee(serializedSize,
 		mp.cfg.Policy.MinRelayTxFee)
-	if txFee < minFee {
+
+	if len(txFees) > 1 {
+		str := fmt.Sprintf("Multi coin type ouput transaction are not supported")
+		return nil, nil, txRuleError(message.RejectNonstandard, str)
+	}
+
+	txFee := types.Amount{Id: tx.Tx.TxOut[0].Amount.Id, Value: 0}
+	if txFees != nil {
+		txFee.Value = txFees[txFee.Id]
+	}
+
+	if txFee.Value < minFee {
 		str := fmt.Sprintf("transaction %v has %v fees which "+
-			"is under the required amount of %v", txHash,
-			txFee, minFee)
+			"is under the required amount of %v, tx size is %v bytes, policy-rate is %v/byte.", txHash,
+			txFee, minFee, serializedSize, mp.cfg.Policy.MinRelayTxFee.Value/1000)
 		return nil, nil, txRuleError(message.RejectInsufficientFee, str)
 	}
 
@@ -410,10 +477,11 @@ func (mp *TxPool) maybeAcceptTransaction(tx *types.Tx, isNew, rateLimit, allowHi
 	// are exempted.
 	//
 	// This applies to non-stake transactions only.
-	if isNew && !mp.cfg.Policy.DisableRelayPriority && txFee < minFee {
+	if isNew && !mp.cfg.Policy.DisableRelayPriority && txFee.Value < minFee {
 
 		currentPriority := CalcPriority(msgTx, utxoView,
 			nextBlockHeight, mp.cfg.BD)
+
 		if currentPriority <= MinHighPriority {
 			str := fmt.Sprintf("transaction %v has insufficient "+
 				"priority (%g <= %g)", txHash,
@@ -425,8 +493,8 @@ func (mp *TxPool) maybeAcceptTransaction(tx *types.Tx, isNew, rateLimit, allowHi
 	// Free-to-relay transactions are rate limited here to prevent
 	// penny-flooding with tiny transactions as a form of attack.
 	// This applies to non-stake transactions only.
-	if rateLimit && txFee < minFee {
-		nowUnix := time.Now().Unix()
+	if rateLimit && txFee.Value < minFee {
+		nowUnix := roughtime.Now().Unix()
 		// Decay passed data with an exponentially decaying ~10 minute
 		// window.
 		mp.pennyTotal *= math.Pow(1.0-1.0/600.0,
@@ -453,10 +521,12 @@ func (mp *TxPool) maybeAcceptTransaction(tx *types.Tx, isNew, rateLimit, allowHi
 	if !allowHighFees {
 		maxFee := calcMinRequiredTxRelayFee(serializedSize*maxRelayFeeMultiplier,
 			mp.cfg.Policy.MinRelayTxFee)
-		if txFee > maxFee {
+
+		mrtf := types.Amount{Id: txFee.Id, Value: mp.cfg.Policy.MinRelayTxFee.Value}
+		if txFee.Value > maxFee {
 			err = fmt.Errorf("transaction %v has %v fee which is above the "+
 				"allowHighFee check threshold amount of %v (= %v byte * %v/kB * %v)", txHash,
-				txFee, maxFee, serializedSize, mp.cfg.Policy.MinRelayTxFee.Format(types.AmountAtom), maxRelayFeeMultiplier)
+				txFee.Value, maxFee, serializedSize, mrtf.Format(types.AmountAtom), maxRelayFeeMultiplier)
 			return nil, nil, err
 		}
 	}
@@ -477,7 +547,7 @@ func (mp *TxPool) maybeAcceptTransaction(tx *types.Tx, isNew, rateLimit, allowHi
 	}
 
 	// Add to transaction pool.
-	txD := mp.addTransaction(utxoView, tx, nextBlockHeight, txFee)
+	txD := mp.addTransaction(utxoView, tx, nextBlockHeight, txFee.Value)
 
 	log.Debug("Accepted transaction", "txHash", txHash, "pool size", len(mp.pool))
 
@@ -955,4 +1025,16 @@ func (mp *TxPool) PruneExpiredTx() {
 	mp.mtx.Lock()
 	mp.pruneExpiredTx()
 	mp.mtx.Unlock()
+}
+
+// Count returns the number of transactions in the main pool.  It does not
+// include the orphan pool.
+//
+// This function is safe for concurrent access.
+func (mp *TxPool) Count() int {
+	mp.mtx.RLock()
+	count := len(mp.pool)
+	mp.mtx.RUnlock()
+
+	return count
 }

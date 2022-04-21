@@ -2,6 +2,7 @@ package blockchain
 
 import (
 	"github.com/Qitmeer/qitmeer/common/hash"
+	"github.com/Qitmeer/qitmeer/common/roughtime"
 	"github.com/Qitmeer/qitmeer/core/blockdag"
 	"github.com/Qitmeer/qitmeer/core/types"
 	"math"
@@ -53,7 +54,7 @@ func (b *BlockChain) GetOrphansParents() []*hash.Hash {
 	result := blockdag.NewHashSet()
 	for _, v := range b.orphans {
 		for _, h := range v.block.Block().Parents {
-			if b.index.HaveBlock(h) || b.isOrphan(h) {
+			if b.bd.HasBlock(h) || b.isOrphan(h) {
 				continue
 			}
 			result.Add(h)
@@ -75,7 +76,7 @@ func (b *BlockChain) GetRecentOrphanParents(h *hash.Hash) []*hash.Hash {
 	}
 	result := blockdag.NewHashSet()
 	for _, h := range ob.Block().Parents {
-		if b.index.HaveBlock(h) || b.isOrphan(h) {
+		if b.bd.HasBlock(h) || b.isOrphan(h) {
 			continue
 		}
 		result.Add(h)
@@ -106,7 +107,7 @@ func (b *BlockChain) GetRecentOrphansParents() []*hash.Hash {
 					continue
 				}
 			}
-			if b.index.HaveBlock(h) || b.isOrphan(h) {
+			if b.bd.HasBlock(h) || b.isOrphan(h) || b.HasBlockInDB(h) {
 				continue
 			}
 			result.Add(h)
@@ -166,7 +167,7 @@ func (b *BlockChain) addOrphanBlock(block *types.SerializedBlock) {
 
 	// Insert the block into the orphan map with an expiration time
 	// 1 hour from now.
-	expiration := time.Now().Add(MaxOrphanStallDuration)
+	expiration := roughtime.Now().Add(MaxOrphanStallDuration)
 	oBlock := &orphanBlock{
 		block:      block,
 		expiration: expiration,
@@ -199,7 +200,7 @@ func (b *BlockChain) processOrphans(flags BehaviorFlags) error {
 		cur := queue[0]
 		queue = queue[1:]
 
-		exists := b.index.HaveBlock(cur.block.Hash())
+		exists := b.bd.HasBlock(cur.block.Hash())
 		if exists {
 			b.RemoveOrphanBlock(cur)
 			continue
@@ -207,7 +208,7 @@ func (b *BlockChain) processOrphans(flags BehaviorFlags) error {
 
 		allExists := true
 		for _, h := range cur.block.Block().Parents {
-			exists := b.index.HaveBlock(h)
+			exists := b.bd.HasBlock(h)
 			if !exists {
 				allExists = false
 			}
@@ -248,7 +249,7 @@ func (b *BlockChain) RefreshOrphans() error {
 func (b *BlockChain) refreshOrphans() {
 	// Remove expired orphan blocks.
 	for _, oBlock := range b.orphans {
-		if time.Now().After(oBlock.expiration) {
+		if roughtime.Now().After(oBlock.expiration) {
 			b.removeOrphanBlock(oBlock)
 			continue
 		}

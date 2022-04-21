@@ -2,16 +2,15 @@ package mining
 
 import (
 	"github.com/Qitmeer/qitmeer/common/hash"
+	"github.com/Qitmeer/qitmeer/common/roughtime"
 	"github.com/Qitmeer/qitmeer/core/types"
 	"math/rand"
-	"time"
 )
 
 // weighted random tx
 type WeightedRandTx struct {
 	tx       *types.Tx
 	fee      int64
-	priority float64
 	feePerKB int64
 
 	dependsOn map[hash.Hash]struct{}
@@ -51,14 +50,14 @@ func (wq *WeightedRandQueue) Pop() *WeightedRandTx {
 		}
 	}
 	wq.items = append(wq.items[:index], wq.items[index+1:]...)
-	total = total - item.fee - 1
+	//total = total - item.fee - 1
 
 	return item
 }
 
 // Build WeightedRandQueue
 func newWeightedRandQueue(reserve int) *WeightedRandQueue {
-	rand.Seed(time.Now().Unix())
+	rand.Seed(roughtime.Now().Unix())
 	wq := &WeightedRandQueue{
 		items: make([]*WeightedRandTx, 0, reserve),
 	}

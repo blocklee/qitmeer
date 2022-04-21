@@ -7,23 +7,10 @@ import (
 	"encoding/binary"
 	"fmt"
 	"github.com/Qitmeer/qitmeer/common/hash"
-	"github.com/Qitmeer/qitmeer/common/math"
+	"github.com/Qitmeer/qitmeer/common/roughtime"
 	s "github.com/Qitmeer/qitmeer/core/serialization"
 	"io"
 	"time"
-)
-
-type TxType byte
-
-const (
-	CoinBase        TxType = 0x01
-	Leger           TxType = 0x02
-	TxTypeRegular   TxType = 0x03
-	AssetIssue      TxType = 0xa0
-	AssetRevoke     TxType = 0xa1
-	ContractCreate  TxType = 0xc0
-	ContractDestroy TxType = 0xc1
-	ContractUpdate  TxType = 0xc2
 )
 
 const (
@@ -113,6 +100,14 @@ const (
 	// NoExpiryValue is the value of expiry that indicates the transaction
 	// has no expiry.
 	NoExpiryValue uint32 = 0
+
+	// TokenPrevOutIndex is the token index field of a previous
+	// outpoint can be.
+	TokenPrevOutIndex uint32 = 0xfffffffe
+
+	// TokenInSequence is the maximum tx type the sequence field
+	// of a transaction input can be.
+	TxTypeInSequence uint32 = 0x400
 )
 
 // TxIndexUnknown is the value returned for a transaction index that is unknown.
@@ -175,7 +170,7 @@ func NewTransaction() *Transaction {
 		Version:   TxVersion,
 		TxIn:      make([]*TxInput, 0, defaultTxInOutAlloc),
 		TxOut:     make([]*TxOutput, 0, defaultTxInOutAlloc),
-		Timestamp: time.Now(),
+		Timestamp: roughtime.Now(),
 	}
 }
 
@@ -217,13 +212,6 @@ func (t *Transaction) AddTxIn(ti *TxInput) {
 // AddTxOut adds a transaction output to the message.
 func (t *Transaction) AddTxOut(to *TxOutput) {
 	t.TxOut = append(t.TxOut, to)
-}
-
-// DetermineTxType determines the type of stake transaction a transaction is; if
-// none, it returns that it is an assumed regular tx.
-func DetermineTxType(tx *Transaction) TxType {
-	//TODO txType
-	return TxTypeRegular
 }
 
 // SerializeSize returns the number of bytes it would take to serialize the
@@ -383,7 +371,11 @@ func WriteOutPoint(w io.Writer, pver uint32, version uint32, op *TxOutPoint) err
 
 // writeTxOut encodes for a transaction output (TxOut) to w.
 func writeTxOut(w io.Writer, pver uint32, to *TxOutput) error {
-	err := s.BinarySerializer.PutUint64(w, binary.LittleEndian, uint64(to.Amount))
+	err := s.BinarySerializer.PutUint16(w, binary.LittleEndian, uint16(to.Amount.Id))
+	if err != nil {
+		return err
+	}
+	err = s.BinarySerializer.PutUint64(w, binary.LittleEndian, uint64(to.Amount.Value))
 	if err != nil {
 		return err
 	}
@@ -483,7 +475,9 @@ func (tx *Transaction) Decode(r io.Reader, pver uint32) error {
 func (tx *Transaction) decodePrefix(r io.Reader) (uint64, error) {
 
 	count, err := s.ReadVarInt(r, 0)
-
+	if err != nil {
+		return 0, err
+	}
 	// Prevent more input transactions than could possibly fit into a
 	// message.  It would be possible to cause memory exhaustion and panics
 	// without a sane upper bound on this count.
@@ -582,11 +576,16 @@ func ReadOutPoint(r io.Reader, version uint32, op *TxOutPoint) error {
 // readTxOut reads the next sequence of bytes from r as a transaction output
 // (TxOut).
 func readTxOut(r io.Reader, to *TxOutput) error {
-	value, err := s.BinarySerializer.Uint64(r, binary.LittleEndian)
+	coinid, err := s.BinarySerializer.Uint16(r, binary.LittleEndian)
 	if err != nil {
 		return err
 	}
-	to.Amount = uint64(value)
+	var value uint64
+	value, err = s.BinarySerializer.Uint64(r, binary.LittleEndian)
+	if err != nil {
+		return err
+	}
+	to.Amount = Amount{int64(value), CoinID(coinid)}
 
 	to.PkScript, err = readScript(r)
 	return err
@@ -770,26 +769,8 @@ func (tx *Transaction) TxHashFull() hash.Hash {
 	return hash.DoubleHashH(tx.mustSerialize(TxSerializeFull))
 }
 
-// IsCoinBaseTx determines whether or not a transaction is a coinbase.  A
-// coinbase is a special transaction created by miners that has no inputs.
-// This is represented in the block chain by a transaction with a single input
-// that has a previous output transaction index set to the maximum value along
-// with a zero hash.
-//
-// This function only differs from IsCoinBase in that it works with a raw wire
-// transaction as opposed to a higher level util transaction.
 func (tx *Transaction) IsCoinBase() bool {
-	// A coin base must only have one transaction input.
-	if len(tx.TxIn) != 1 {
-		return false
-	}
-	// The previous output of a coin base must have a max value index and a
-	// zero hash.
-	prevOut := &tx.TxIn[0].PreviousOut
-	/*if prevOut.OutIndex != math.MaxUint32 || !prevOut.Hash.IsEqual(&hash.ZeroHash) {
-		return false
-	}*/
-	return prevOut.OutIndex == math.MaxUint32
+	return IsCoinBaseTx(tx)
 }
 
 // Tx defines a transaction that provides easier and more efficient manipulation
@@ -956,6 +937,7 @@ type TxInput struct {
 	// however, its most relevant purpose is to enable “locking” of payments
 	// so that they cannot be redeemed until a certain time.
 	Sequence uint32 //work with LockTime (disable use 0xffffffff, bitcoin historical)
+	AmountIn Amount
 }
 
 // NewTxIn returns a new transaction input with the provided  previous outpoint
@@ -999,13 +981,13 @@ func (ti *TxInput) SerializeSizeWitness() int {
 }
 
 type TxOutput struct {
-	Amount   uint64
+	Amount   Amount
 	PkScript []byte //Here, asm/type -> OP_XXX OP_RETURN
 }
 
 // NewTxOutput returns a new bitcoin transaction output with the provided
 // transaction value and public key script.
-func NewTxOutput(amount uint64, pkScript []byte) *TxOutput {
+func NewTxOutput(amount Amount, pkScript []byte) *TxOutput {
 	return &TxOutput{
 		Amount:   amount,
 		PkScript: pkScript,
@@ -1019,9 +1001,9 @@ func (to *TxOutput) GetPkScript() []byte {
 // SerializeSize returns the number of bytes it would take to serialize the
 // the transaction output.
 func (to *TxOutput) SerializeSize() int {
-	// Value 8 bytes + serialized varint size for
+	// CoinId 2 bytes + Value 8 bytes + serialized varint size for
 	// the length of PkScript + PkScript bytes.
-	return 8 + s.VarIntSerializeSize(uint64(len(to.PkScript))) + len(to.PkScript)
+	return 2 + 8 + s.VarIntSerializeSize(uint64(len(to.PkScript))) + len(to.PkScript)
 }
 
 type ContractTransaction struct {
@@ -1131,7 +1113,37 @@ func (c scriptFreeList) Return(buf []byte) {
 	}
 }
 
+// NewTxFromBytes returns a new instance of a bitcoin transaction given the
+// serialized bytes.  See Tx.
+func NewTxFromBytes(serializedTx []byte) (*Tx, error) {
+	br := bytes.NewReader(serializedTx)
+	return NewTxFromReader(br)
+}
+
+// NewTxFromReader returns a new instance of a bitcoin transaction given a
+// Reader to deserialize the transaction.  See Tx.
+func NewTxFromReader(r io.Reader) (*Tx, error) {
+	// Deserialize the bytes into a MsgTx.
+	var msgTx Transaction
+	err := msgTx.Deserialize(r)
+	if err != nil {
+		return nil, err
+	}
+
+	t := Tx{
+		Tx:          &msgTx,
+		IsDuplicate: false,
+		hash:        msgTx.TxHash(),
+		txIndex:     TxIndexUnknown,
+	}
+	return &t, nil
+}
+
 // Create the concurrent safe free list to use for script deserialization.  As
 // previously described, this free list is maintained to significantly reduce
 // the number of allocations.
 var scriptPool scriptFreeList = make(chan []byte, freeListMaxItems)
+
+func IsSequenceLockTimeDisabled(sequence uint32) bool {
+	return sequence&SequenceLockTimeDisabled != 0 || sequence <= TxTypeInSequence
+}

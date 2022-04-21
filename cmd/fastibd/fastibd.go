@@ -1,13 +1,14 @@
 package main
 
 import (
+	"github.com/Qitmeer/qitmeer/common/roughtime"
 	_ "github.com/Qitmeer/qitmeer/database/ffldb"
 	_ "github.com/Qitmeer/qitmeer/services/common"
 	"github.com/urfave/cli/v2"
 	"os"
 	"runtime"
 	"runtime/debug"
-	"time"
+	ver "github.com/Qitmeer/qitmeer/version"
 )
 
 func main() {
@@ -22,11 +23,12 @@ func main() {
 func fastIBD() error {
 	cfg := &Config{}
 	node := &Node{}
+	aidnode := &AidNode{}
 
 	app := &cli.App{
 		Name:     "FastIBD",
-		Version:  "V0.0.1",
-		Compiled: time.Now(),
+		Version:  ver.String(),
+		Compiled: roughtime.Now(),
 		Authors: []*cli.Author{
 			&cli.Author{
 				Name: "Qitmeer",
@@ -97,6 +99,47 @@ func fastIBD() error {
 					return node.Import()
 				},
 			},
+			&cli.Command{
+				Name:        "upgrade",
+				Aliases:     []string{"u"},
+				Category:    "IBD",
+				Usage:       "Upgrade all blocks from database for Qitmeer",
+				Description: "Upgrade all blocks from database for Qitmeer",
+				Flags: []cli.Flag{
+					&cli.StringFlag{
+						Name:        "path",
+						Aliases:     []string{"p"},
+						Usage:       "Path to input data",
+						Value:       defaultHomeDir,
+						Destination: &cfg.InputPath,
+					},
+					&cli.BoolFlag{
+						Name:        "aidmode",
+						Aliases:     []string{"ai"},
+						Usage:       "Export by block id",
+						Value:       false,
+						Destination: &cfg.AidMode,
+					},
+				},
+				Before: func(c *cli.Context) error {
+					if cfg.AidMode {
+						return aidnode.init(cfg)
+					}
+					return node.init(cfg)
+				},
+				After: func(c *cli.Context) error {
+					if cfg.AidMode {
+						return aidnode.exit()
+					}
+					return node.exit()
+				},
+				Action: func(c *cli.Context) error {
+					if cfg.AidMode {
+						return aidnode.Upgrade()
+					}
+					return node.Upgrade()
+				},
+			},
 		},
 		Flags: []cli.Flag{
 			&cli.StringFlag{
@@ -116,7 +159,7 @@ func fastIBD() error {
 			&cli.BoolFlag{
 				Name:        "testnet",
 				Usage:       "Use the test network",
-				Value:       true,
+				Value:       false,
 				Destination: &cfg.TestNet,
 			},
 			&cli.BoolFlag{
@@ -140,7 +183,7 @@ func fastIBD() error {
 			&cli.StringFlag{
 				Name:        "dagtype",
 				Aliases:     []string{"G"},
-				Usage:       "DAG type {phantom,conflux,spectre}",
+				Usage:       "DAG type {phantom,spectre}",
 				Value:       defaultDAGType,
 				Destination: &cfg.DAGType,
 			},
@@ -149,6 +192,12 @@ func fastIBD() error {
 				Usage:       "Hide progress bar",
 				Value:       false,
 				Destination: &cfg.DisableBar,
+			},
+			&cli.IntFlag{
+				Name:        "cpunum",
+				Usage:       "Use the num of cpu",
+				Value:       runtime.NumCPU(),
+				Destination: &cfg.CPUNum,
 			},
 		},
 		EnableBashCompletion: true,

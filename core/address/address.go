@@ -19,7 +19,8 @@ import (
 func encodeAddress(hash160 []byte, netID [2]byte) string {
 	// Format is 2 bytes for a network and address class (i.e. P2PKH vs
 	// P2SH), 20 bytes for a RIPEMD160 hash, and 4 bytes of checksum.
-	return base58.QitmeerCheckEncode(hash160[:ripemd160.Size], netID[:])
+	res, _ := base58.QitmeerCheckEncode(hash160[:ripemd160.Size], netID[:])
+	return string(res)
 }
 
 // encodePKAddress returns a human-readable payment address to a public key
@@ -54,7 +55,8 @@ func encodePKAddress(serializedPK []byte, netID [2]byte, algo ecc.EcType) string
 	}
 
 	pubKeyBytes = append(pubKeyBytes, compressed...)
-	return base58.QitmeerCheckEncode(pubKeyBytes, netID[:])
+	res, _ := base58.QitmeerCheckEncode(pubKeyBytes, netID[:])
+	return string(res)
 }
 
 // PubKeyHashAddress is an Address for a pay-to-pubkey-hash (P2PKH)
@@ -176,9 +178,9 @@ func NewPubKeyAddress(decoded []byte, net *params.Params) (types.Address, error)
 	return nil, ErrUnknownAddressType
 }
 
-// ScriptAddress returns the bytes to be included in a txout script to pay
+// Script returns the bytes to be included in a txout script to pay
 // to a pubkey hash.  Part of the Address interface.
-func (a *PubKeyHashAddress) ScriptAddress() []byte {
+func (a *PubKeyHashAddress) Script() []byte {
 	return a.hash[:]
 }
 
@@ -190,11 +192,16 @@ type ScriptHashAddress struct {
 	netID [2]byte
 }
 
+// NewAddressScriptHash returns a new AddressScriptHash.
+func NewScriptHashAddress(serializedScript []byte, net *params.Params) (*ScriptHashAddress, error) {
+	scriptHash := hash.Hash160(serializedScript)
+	return newScriptHashAddressFromHash(scriptHash, net.ScriptHashAddrID)
+}
+
 // NewAddressScriptHashFromHash returns a new AddressScriptHash.  scriptHash
 // must be 20 bytes.
-// TODO refactor method name
-func NewAddressScriptHashFromHash(scriptHash []byte, net *params.Params) (*ScriptHashAddress, error) {
-	ash, err := newAddressScriptHashFromHash(scriptHash, net.ScriptHashAddrID)
+func NewScriptHashAddressFromHash(scriptHash []byte, net *params.Params) (*ScriptHashAddress, error) {
+	ash, err := newScriptHashAddressFromHash(scriptHash, net.ScriptHashAddrID)
 	if err != nil {
 		return nil, err
 	}
@@ -208,8 +215,7 @@ func NewAddressScriptHashFromHash(scriptHash []byte, net *params.Params) (*Scrip
 // looking it up through its parameters.  This is useful when creating a new
 // address structure from a string encoding where the identifer byte is already
 // known.
-// TODO refactor method name
-func newAddressScriptHashFromHash(scriptHash []byte, netID [2]byte) (*ScriptHashAddress, error) {
+func newScriptHashAddressFromHash(scriptHash []byte, netID [2]byte) (*ScriptHashAddress, error) {
 	// Check for a valid script hash length.
 	if len(scriptHash) != ripemd160.Size {
 		return nil, errors.New("scriptHash must be 20 bytes")
@@ -241,9 +247,9 @@ func (a *ScriptHashAddress) EcType() ecc.EcType {
 	return ecc.ECDSA_Secp256k1
 }
 
-// ScriptAddress returns the bytes to be included in a txout script to pay
+// Script returns the bytes to be included in a txout script to pay
 // to a script hash.  Part of the Address interface.
-func (a *ScriptHashAddress) ScriptAddress() []byte {
+func (a *ScriptHashAddress) Script() []byte {
 	return a.hash[:]
 }
 
@@ -376,10 +382,10 @@ func toPKHAddress(net *params.Params, netID [2]byte, b []byte) *PubKeyHashAddres
 	return addr
 }
 
-// ScriptAddress returns the bytes to be included in a txout script to pay
+// Script returns the bytes to be included in a txout script to pay
 // to a public key.  Setting the public key format will affect the output of
 // this function accordingly.  Part of the Address interface.
-func (a *SecpPubKeyAddress) ScriptAddress() []byte {
+func (a *SecpPubKeyAddress) Script() []byte {
 	return a.serialize()
 }
 
@@ -440,10 +446,10 @@ func (a *EdwardsPubKeyAddress) PKHAddress() *PubKeyHashAddress {
 	return toPKHAddress(a.net, a.pubKeyHashID, a.serialize())
 }
 
-// ScriptAddress returns the bytes to be included in a txout script to pay
+// Script returns the bytes to be included in a txout script to pay
 // to a public key.  Setting the public key format will affect the output of
 // this function accordingly.  Part of the Address interface.
-func (a *EdwardsPubKeyAddress) ScriptAddress() []byte {
+func (a *EdwardsPubKeyAddress) Script() []byte {
 	return a.serialize()
 }
 
@@ -503,10 +509,10 @@ func (a *SecSchnorrPubKeyAddress) PKHAddress() *PubKeyHashAddress {
 	return toPKHAddress(a.net, a.pubKeyHashID, a.serialize())
 }
 
-// ScriptAddress returns the bytes to be included in a txout script to pay
+// Script returns the bytes to be included in a txout script to pay
 // to a public key.  Setting the public key format will affect the output of
 // this function accordingly.  Part of the Address interface.
-func (a *SecSchnorrPubKeyAddress) ScriptAddress() []byte {
+func (a *SecSchnorrPubKeyAddress) Script() []byte {
 	return a.serialize()
 }
 
@@ -549,8 +555,7 @@ func DecodeAddress(addr string) (types.Address, error) {
 		return NewPubKeyHashAddress(decoded, net, ecc.ECDSA_SecpSchnorr)
 
 	case net.ScriptHashAddrID:
-		//TODO refactor method name
-		return NewAddressScriptHashFromHash(decoded, net)
+		return NewScriptHashAddressFromHash(decoded, net)
 
 	default:
 		return nil, ErrUnknownAddressType

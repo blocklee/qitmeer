@@ -42,7 +42,7 @@ func (sp *Spectre) Init(bd *BlockDAG) bool {
 	return true
 }
 
-func (sp *Spectre) AddBlock(b IBlock) *list.List {
+func (sp *Spectre) AddBlock(b IBlock) (*list.List, *list.List) {
 	if sp.sblocks == nil {
 		sp.sblocks = map[hash.Hash]*SpectreBlock{}
 	}
@@ -51,7 +51,7 @@ func (sp *Spectre) AddBlock(b IBlock) *list.List {
 
 	var result *list.List = list.New()
 	result.PushBack(block.GetHash())
-	return result
+	return result, nil
 }
 
 // Build self block
@@ -60,10 +60,6 @@ func (sp *Spectre) CreateBlock(b *Block) IBlock {
 }
 
 func (sp *Spectre) GetTipsList() []IBlock {
-	return nil
-}
-
-func (sp *Spectre) GetBlockByOrder(order uint) *hash.Hash {
 	return nil
 }
 
@@ -814,6 +810,10 @@ func (sp *Spectre) IsOnMainChain(b IBlock) bool {
 // return the tip of main chain
 func (sp *Spectre) GetMainChainTip() IBlock {
 	return nil
+}
+
+func (sp *Spectre) GetMainChainTipId() uint {
+	return 0
 }
 
 // return the main parent in the parents

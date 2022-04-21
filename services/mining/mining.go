@@ -7,10 +7,12 @@
 package mining
 
 import (
+	"fmt"
 	"github.com/Qitmeer/qitmeer/common/hash"
 	"github.com/Qitmeer/qitmeer/core/blockchain"
+	"github.com/Qitmeer/qitmeer/core/blockchain/opreturn"
+	"github.com/Qitmeer/qitmeer/core/blockdag"
 	"github.com/Qitmeer/qitmeer/core/merkle"
-	"github.com/Qitmeer/qitmeer/core/protocol"
 	s "github.com/Qitmeer/qitmeer/core/serialization"
 	"github.com/Qitmeer/qitmeer/core/types"
 	"github.com/Qitmeer/qitmeer/engine/txscript"
@@ -33,25 +35,6 @@ const (
 	// sig.
 	// TODO, refactor the location of coinbaseFlags const
 	CoinbaseFlags = "/qitmeer/"
-
-	// generatedBlockVersion is the version of the block being generated for
-	// the main network.  It is defined as a constant here rather than using
-	// the wire.BlockVersion constant since a change in the block version
-	// will require changes to the generated block.  Using the wire constant
-	// for generated block version could allow creation of invalid blocks
-	// for the updated version.
-	// TODO, refactor the location of generatedBlockVersion const
-	GeneratedBlockVersion = 1
-
-	// generatedBlockVersionTest is the version of the block being generated
-	// for networks other than the main network.
-	// TODO, refactor the location of generatedBlockVersionTest const
-	GeneratedBlockVersionTest = 12
-
-	// generatedBlockVersionTestMixPow is the version of the block being generated
-	// for networks other than the main network.
-	// TODO, refactor the location of generatedBlockVersionTestPow const
-	generatedBlockVersionTestMixPow = 18
 )
 
 // TxSource represents a source of transactions to consider for inclusion in
@@ -93,10 +76,13 @@ func MedianAdjustedTime(bc *blockchain.BlockChain, timeSource blockchain.MedianT
 	return newTimestamp
 }
 
-func standardCoinbaseScript(nextBlockHeight uint64, extraNonce uint64) ([]byte, error) {
-	return txscript.NewScriptBuilder().AddInt64(int64(nextBlockHeight)).
-		AddInt64(int64(extraNonce)).AddData([]byte(CoinbaseFlags)).
-		Script()
+func standardCoinbaseScript(nextBlockHeight uint64, extraNonce uint64, extraData string) ([]byte, error) {
+	scriptBuilder := txscript.NewScriptBuilder().AddInt64(int64(nextBlockHeight)).
+		AddInt64(int64(extraNonce)).AddData([]byte(CoinbaseFlags))
+	if extraData != "" {
+		scriptBuilder = scriptBuilder.AddData([]byte(extraData))
+	}
+	return scriptBuilder.Script()
 }
 
 // standardCoinbaseOpReturn creates a standard OP_RETURN output to insert into
@@ -118,7 +104,7 @@ func standardCoinbaseOpReturn(enData []byte) ([]byte, error) {
 //
 // See the comment for NewBlockTemplate for more information about why the nil
 // address handling is useful.
-func createCoinbaseTx(subsidyCache *blockchain.SubsidyCache, coinbaseScript []byte, opReturnPkScript []byte, nextBlocks int64, addr types.Address, params *params.Params) (*types.Tx, error) {
+func createCoinbaseTx(subsidyCache *blockchain.SubsidyCache, coinbaseScript []byte, bi *blockdag.BlueInfo, addr types.Address, params *params.Params, opReturnPkScript []byte) (*types.Tx, *types.TxOutput, *types.TxOutput, error) {
 	tx := types.NewTransaction()
 	tx.AddTxIn(&types.TxInput{
 		// Coinbase transactions have no inputs, so previous outpoint is
@@ -131,9 +117,9 @@ func createCoinbaseTx(subsidyCache *blockchain.SubsidyCache, coinbaseScript []by
 
 	// Create a coinbase with correct block subsidy and extranonce.
 	subsidy := blockchain.CalcBlockWorkSubsidy(subsidyCache,
-		nextBlocks, params)
+		bi, params)
 	tax := blockchain.CalcBlockTaxSubsidy(subsidyCache,
-		nextBlocks, params)
+		bi, params)
 
 	// output
 	// Create the script to pay to the provided payment address if one was
@@ -144,13 +130,13 @@ func createCoinbaseTx(subsidyCache *blockchain.SubsidyCache, coinbaseScript []by
 	if addr != nil {
 		pksSubsidy, err = txscript.PayToAddrScript(addr)
 		if err != nil {
-			return nil, err
+			return nil, nil, nil, err
 		}
 	} else {
 		scriptBuilder := txscript.NewScriptBuilder()
 		pksSubsidy, err = scriptBuilder.AddOp(txscript.OP_TRUE).Script()
 		if err != nil {
-			return nil, err
+			return nil, nil, nil, err
 		}
 	}
 	if !params.HasTax() {
@@ -159,37 +145,30 @@ func createCoinbaseTx(subsidyCache *blockchain.SubsidyCache, coinbaseScript []by
 	}
 	// Subsidy paid to miner.
 	tx.AddTxOut(&types.TxOutput{
-		Amount:   subsidy,
+		Amount:   types.Amount{Value: int64(subsidy), Id: types.MEERID},
 		PkScript: pksSubsidy,
 	})
 
 	// Tax output.
+	var taxOutput *types.TxOutput
 	if params.HasTax() {
-		tx.AddTxOut(&types.TxOutput{
-			Amount:   uint64(tax),
+		taxOutput = &types.TxOutput{
+			Amount:   types.Amount{Value: int64(tax), Id: types.MEERID},
 			PkScript: params.OrganizationPkScript,
-		})
+		}
 	}
-	// nulldata.
-	if opReturnPkScript != nil {
-		tx.AddTxOut(&types.TxOutput{
-			Amount:   0,
-			PkScript: opReturnPkScript,
-		})
-	}
-	return types.NewTx(tx), nil
-}
 
-func BlockVersion(net protocol.Network) uint32 {
-	blockVersion := uint32(GeneratedBlockVersion)
-	if net != protocol.MainNet {
-		blockVersion = GeneratedBlockVersionTest
+	// opReturnPkScript
+	var opReturnOutput *types.TxOutput
+	if len(opReturnPkScript) > 0 {
+		opReturnOutput = &types.TxOutput{
+			PkScript: opReturnPkScript,
+		}
+	} else {
+		opReturnOutput = opreturn.GetOPReturnTxOutput(opreturn.NewShowAmount(int64(subsidy)))
 	}
-	// block version for mix test net,discriminate other net
-	if net == protocol.MixNet {
-		blockVersion = generatedBlockVersionTestMixPow
-	}
-	return blockVersion
+
+	return types.NewTx(tx), taxOutput, opReturnOutput, nil
 }
 
 func fillWitnessToCoinBase(blockTxns []*types.Tx) error {
@@ -199,5 +178,27 @@ func fillWitnessToCoinBase(blockTxns []*types.Tx) error {
 	witnessCommitment := hash.DoubleHashH(witnessPreimage[:])
 	blockTxns[0].Tx.TxIn[0].PreviousOut.Hash = witnessCommitment
 	blockTxns[0].RefreshHash()
+	return nil
+}
+
+func fillOutputsToCoinBase(coinbaseTx *types.Tx, blockFeesMap types.AmountMap, taxOutput *types.TxOutput, oprOutput *types.TxOutput) error {
+	if len(coinbaseTx.Tx.TxOut) != blockchain.CoinbaseOutput_subsidy+1 {
+		return fmt.Errorf("coinbase output error")
+	}
+	for k, v := range blockFeesMap {
+		if v <= 0 || k == types.MEERID {
+			continue
+		}
+		coinbaseTx.Tx.AddTxOut(&types.TxOutput{
+			Amount:   types.Amount{Value: 0, Id: k},
+			PkScript: coinbaseTx.Tx.TxOut[0].GetPkScript(),
+		})
+	}
+	if taxOutput != nil {
+		coinbaseTx.Tx.AddTxOut(taxOutput)
+	}
+	if oprOutput != nil {
+		coinbaseTx.Tx.AddTxOut(oprOutput)
+	}
 	return nil
 }

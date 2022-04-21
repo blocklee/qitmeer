@@ -41,9 +41,9 @@ func TestAddress(t *testing.T) {
 		{
 			// prikey 7e445aa5ffd834cb2d3b2db50f8997dd21af29bec3d296aaa066d902b93f484b
 			name:      "privNet p2pkh NewPubKeyHashAddress",
-			addr:      "Xmmtg1PwEaMyM8VbFjPrz2ppo17Z5wmHUmG",
+			addr:      "XmNZ52HdwsBWUK4TAhyXfYhZ1NcJ9HC88oh",
 			pubkeystr: "0354455a60d86273d322eebb913d87f428988ce97922a366f0a0867a426df78bc9",
-			encoded:   "Xmmtg1PwEaMyM8VbFjPrz2ppo17Z5wmHUmG",
+			encoded:   "XmNZ52HdwsBWUK4TAhyXfYhZ1NcJ9HC88oh",
 			valid:     true,
 			result: &PubKeyHashAddress{
 				net:   mixNetParams,
@@ -85,9 +85,9 @@ func TestAddress(t *testing.T) {
 		{
 			// prikey 7e445aa5ffd834cb2d3b2db50f8997dd21af29bec3d296aaa066d902b93f484b
 			name:      "mainNet p2pkh NewPubKeyHashAddress",
-			addr:      "NmVBjxT3GzCW5btcoxqXJc5Xe4M8hAqZJgR",
+			addr:      "MmYWtAp7nkDmuqUYLSRZQn2LMRi2rsAdJLr",
 			pubkeystr: "0354455a60d86273d322eebb913d87f428988ce97922a366f0a0867a426df78bc9",
-			encoded:   "NmVBjxT3GzCW5btcoxqXJc5Xe4M8hAqZJgR",
+			encoded:   "MmYWtAp7nkDmuqUYLSRZQn2LMRi2rsAdJLr",
 			valid:     true,
 			result: &PubKeyHashAddress{
 				net:   mainNetParams,
@@ -107,9 +107,9 @@ func TestAddress(t *testing.T) {
 		{
 			// prikey 7e445aa5ffd834cb2d3b2db50f8997dd21af29bec3d296aaa066d902b93f484b
 			name:      "testNet p2pkh NewPubKeyHashAddress",
-			addr:      "TmbsdsjwzuGboFQ9GcKg6EUmrr3tokzozyF",
+			addr:      "TnQYqqxYaKdXYtGRSfALjCjKS74QhEXaQZp",
 			pubkeystr: "0354455a60d86273d322eebb913d87f428988ce97922a366f0a0867a426df78bc9",
-			encoded:   "TmbsdsjwzuGboFQ9GcKg6EUmrr3tokzozyF",
+			encoded:   "TnQYqqxYaKdXYtGRSfALjCjKS74QhEXaQZp",
 			valid:     true,
 			result: &PubKeyHashAddress{
 				net:   testNetParams,
@@ -158,14 +158,14 @@ func TestAddress(t *testing.T) {
 				pushData := []byte{
 					0x77, 0xca, 0x77, 0xb8, 0x27, 0x72, 0xbb, 0xf6, 0x86, 0x27,
 					0xe5, 0x00, 0x44, 0xa0, 0x82, 0x3e, 0xa9, 0xaf, 0x4f, 0x30}
-				return NewAddressScriptHashFromHash(pushData, privNetParams)
+				return NewScriptHashAddressFromHash(pushData, privNetParams)
 			},
 			net: privNetParams,
 		},
 		{
 			name:    "mainNet p2sh NewAddressScriptHashFromHash",
-			addr:    "NSYJEU4c9ZFcUydu5i3HzJpYW4tHczukQPz",
-			encoded: "NSYJEU4c9ZFcUydu5i3HzJpYW4tHczukQPz",
+			addr:    "MSCHmhKPNc6RSPngXACzmze5RojvqusFGeN",
+			encoded: "MSCHmhKPNc6RSPngXACzmze5RojvqusFGeN",
 			valid:   true,
 			result: &ScriptHashAddress{
 				net:   mainNetParams,
@@ -178,7 +178,7 @@ func TestAddress(t *testing.T) {
 				pushData := []byte{
 					0x77, 0xca, 0x77, 0xb8, 0x27, 0x72, 0xbb, 0xf6, 0x86, 0x27,
 					0xe5, 0x00, 0x44, 0xa0, 0x82, 0x3e, 0xa9, 0xaf, 0x4f, 0x30}
-				return NewAddressScriptHashFromHash(pushData, mainNetParams)
+				return NewScriptHashAddressFromHash(pushData, mainNetParams)
 			},
 			net: mainNetParams,
 		},
@@ -198,14 +198,14 @@ func TestAddress(t *testing.T) {
 				pushData := []byte{
 					0x77, 0xca, 0x77, 0xb8, 0x27, 0x72, 0xbb, 0xf6, 0x86, 0x27,
 					0xe5, 0x00, 0x44, 0xa0, 0x82, 0x3e, 0xa9, 0xaf, 0x4f, 0x30}
-				return NewAddressScriptHashFromHash(pushData, testNetParams)
+				return NewScriptHashAddressFromHash(pushData, testNetParams)
 			},
 			net: testNetParams,
 		},
 		{
 			name:    "mixNet p2sh NewAddressScriptHashFromHash",
-			addr:    "XdHnr7qFbc78XmWVn7WHxLpv7NmQYJRz6Rx",
-			encoded: "XdHnr7qFbc78XmWVn7WHxLpv7NmQYJRz6Rx",
+			addr:    "XSRfZXuCpSEcsgojSTBJMFSZsP9T58yB1Z5",
+			encoded: "XSRfZXuCpSEcsgojSTBJMFSZsP9T58yB1Z5",
 			valid:   true,
 			result: &ScriptHashAddress{
 				net:   mixNetParams,
@@ -218,7 +218,7 @@ func TestAddress(t *testing.T) {
 				pushData := []byte{
 					0x77, 0xca, 0x77, 0xb8, 0x27, 0x72, 0xbb, 0xf6, 0x86, 0x27,
 					0xe5, 0x00, 0x44, 0xa0, 0x82, 0x3e, 0xa9, 0xaf, 0x4f, 0x30}
-				return NewAddressScriptHashFromHash(pushData, mixNetParams)
+				return NewScriptHashAddressFromHash(pushData, mixNetParams)
 			},
 			net: mixNetParams,
 		},
@@ -248,10 +248,10 @@ func TestAddress(t *testing.T) {
 			var saddr []byte
 			switch d := decoded.(type) {
 			case *PubKeyHashAddress:
-				decoded := base58.Decode(encode)
+				decoded := base58.Decode([]byte(encode))
 				saddr = decoded[2 : 2+ripemd160.Size]
 			case *ScriptHashAddress:
-				decoded := base58.Decode(encode)
+				decoded := base58.Decode([]byte(encode))
 				saddr = decoded[2 : 2+ripemd160.Size]
 			case *SecpPubKeyAddress:
 				// Ignore the error here since the script
@@ -269,11 +269,11 @@ func TestAddress(t *testing.T) {
 				// address is checked below.
 				saddr, _ = hex.DecodeString(d.String())
 			}
-			// Check script address, as well as the Hash160 method for P2PKH and
+			// Check address script, as well as the Hash160 method for P2PKH and
 			// P2SH addresses.
-			if !bytes.Equal(saddr, decoded.ScriptAddress()) {
-				t.Errorf("%v: script addresses do not match:\n%x != \n%x",
-					test.name, saddr, decoded.ScriptAddress())
+			if !bytes.Equal(saddr, decoded.Script()) {
+				t.Errorf("%v: addresses script do not match:\n%x != \n%x",
+					test.name, saddr, decoded.Script())
 				return
 			}
 			switch a := decoded.(type) {
@@ -322,10 +322,10 @@ func TestAddress(t *testing.T) {
 				test.name, err)
 			return
 		}
-		if !reflect.DeepEqual(addr.ScriptAddress(), test.result.ScriptAddress()) {
+		if !reflect.DeepEqual(addr.Script(), test.result.Script()) {
 			t.Errorf("%v: created address does not match expected result \n "+
 				"	got %x, expected %x",
-				test.name, addr.ScriptAddress(), test.result.ScriptAddress())
+				test.name, addr.Script(), test.result.Script())
 			return
 		}
 		if addr.String() != test.addr {

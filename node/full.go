@@ -3,11 +3,11 @@ package node
 
 import (
 	"github.com/Qitmeer/qitmeer/core/blockchain"
+	"github.com/Qitmeer/qitmeer/core/coinbase"
 	"github.com/Qitmeer/qitmeer/database"
 	"github.com/Qitmeer/qitmeer/engine/txscript"
 	"github.com/Qitmeer/qitmeer/node/notify"
-	"github.com/Qitmeer/qitmeer/p2p/peerserver"
-	"github.com/Qitmeer/qitmeer/params"
+	"github.com/Qitmeer/qitmeer/p2p"
 	"github.com/Qitmeer/qitmeer/rpc"
 	"github.com/Qitmeer/qitmeer/services/acct"
 	"github.com/Qitmeer/qitmeer/services/address"
@@ -37,7 +37,7 @@ type QitmeerFull struct {
 	txManager *tx.TxManager
 
 	// miner service
-	cpuMiner *miner.CPUMiner
+	miner *miner.Miner
 
 	// address service
 	addressApi *address.AddressApi
@@ -48,42 +48,31 @@ type QitmeerFull struct {
 	sigCache *txscript.SigCache
 }
 
-func (qm *QitmeerFull) Start(server *peerserver.PeerServer) error {
+func (qm *QitmeerFull) Start() error {
 	log.Debug("Starting Qitmeer full node service")
-
-	// Start the CPU miner if generation is enabled.
-	if qm.node.Config.Generate {
-		qm.cpuMiner.Start()
-	}
-
 	qm.blockManager.Start()
 	qm.txManager.Start()
+	qm.miner.Start()
 	return nil
 }
 
 func (qm *QitmeerFull) Stop() error {
 	log.Debug("Stopping Qitmeer full node service")
+	log.Info("try stop miner")
+	qm.miner.Stop()
 
 	log.Info("try stop bm")
-
 	qm.blockManager.Stop()
 	qm.blockManager.WaitForStop()
 
 	qm.txManager.Stop()
-
-	log.Info("try stop cpu miner")
-	// Stop the CPU miner if needed.
-	if qm.node.Config.Generate && qm.cpuMiner != nil {
-		qm.cpuMiner.Stop()
-	}
-
 	return nil
 }
 
 func (qm *QitmeerFull) APIs() []rpc.API {
 	apis := qm.acctmanager.APIs()
 	apis = append(apis, qm.addressApi.APIs()...)
-	apis = append(apis, qm.cpuMiner.APIs()...)
+	apis = append(apis, qm.miner.APIs()...)
 	apis = append(apis, qm.blockManager.API())
 	apis = append(apis, qm.txManager.APIs()...)
 	apis = append(apis, qm.apis()...)
@@ -127,23 +116,30 @@ func newQitmeerFullNode(node *Node) (*QitmeerFull, error) {
 
 	// block-manager
 	bm, err := blkmgr.NewBlockManager(qm.nfManager, indexManager, node.DB, qm.timeSource, qm.sigCache, node.Config, node.Params,
-		mining.BlockVersion(node.Params.Net), node.quit)
+		node.quit, &node.events, node.peerServer)
 	if err != nil {
 		return nil, err
 	}
 	qm.blockManager = bm
 
 	// txmanager
-	tm, err := tx.NewTxManager(bm, txIndex, addrIndex, cfg, qm.nfManager, qm.sigCache, node.DB)
+	tm, err := tx.NewTxManager(bm, txIndex, addrIndex, cfg, qm.nfManager, qm.sigCache, node.DB, &node.events)
 	if err != nil {
 		return nil, err
 	}
 	qm.txManager = tm
 	bm.SetTxManager(tm)
 	// prepare peerServer
-	node.peerServer.BlockManager = bm
-	node.peerServer.TimeSource = qm.timeSource
-	node.peerServer.TxMemPool = qm.txManager.MemPool().(*mempool.TxPool)
+	node.peerServer.SetBlockChain(bm.GetChain())
+	node.peerServer.SetTimeSource(qm.timeSource)
+	node.peerServer.SetTxMemPool(qm.txManager.MemPool().(*mempool.TxPool))
+	node.peerServer.SetNotify(qm.nfManager)
+
+	if node.rpcServer != nil {
+		node.rpcServer.BC = bm.GetChain()
+		node.rpcServer.TxIndex = txIndex
+		node.rpcServer.ChainParams = bm.ChainParams()
+	}
 
 	// Cpu Miner
 	// Create the mining policy based on the configuration options.
@@ -157,14 +153,11 @@ func newQitmeerFullNode(node *Node) (*QitmeerFull, error) {
 		StandardVerifyFlags: func() (txscript.ScriptFlags, error) {
 			return common.StandardScriptVerifyFlags()
 		}, //TODO, duplicated config item with mem-pool
+		CoinbaseGenerator: coinbase.NewCoinbaseGenerator(node.Params, qm.node.peerServer.PeerID().String()),
 	}
-	// defaultNumWorkers is the default number of workers to use for mining
-	// and is based on the number of processor cores.  This helps ensure the
-	// system stays reasonably responsive under heavy load.
-	defaultNumWorkers := uint32(params.CPUMinerThreads) //TODO, move to config
+	qm.miner = miner.NewMiner(cfg, &policy, qm.sigCache,
+		qm.txManager.MemPool().(*mempool.TxPool), qm.timeSource, qm.blockManager, &node.events)
 
-	qm.cpuMiner = miner.NewCPUMiner(cfg, node.Params, &policy, qm.sigCache,
-		qm.txManager.MemPool().(*mempool.TxPool), qm.timeSource, qm.blockManager, defaultNumWorkers)
 	// init address api
 	qm.addressApi = address.NewAddressApi(cfg, node.Params)
 	return &qm, nil
@@ -175,17 +168,12 @@ func (qm *QitmeerFull) GetBlockManager() *blkmgr.BlockManager {
 	return qm.blockManager
 }
 
-// return cpu miner
-func (qm *QitmeerFull) GetCpuMiner() *miner.CPUMiner {
-	return qm.cpuMiner
-}
-
 // return address api
 func (qm *QitmeerFull) GetAddressApi() *address.AddressApi {
 	return qm.addressApi
 }
 
 // return peer server
-func (qm *QitmeerFull) GetPeerServer() *peerserver.PeerServer {
+func (qm *QitmeerFull) GetPeerServer() *p2p.Service {
 	return qm.node.peerServer
 }

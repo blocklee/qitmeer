@@ -8,15 +8,18 @@ package params
 
 import (
 	"github.com/Qitmeer/qitmeer/common"
+	"github.com/Qitmeer/qitmeer/common/math"
 	"github.com/Qitmeer/qitmeer/core/protocol"
 	"github.com/Qitmeer/qitmeer/core/types/pow"
+	"github.com/Qitmeer/qitmeer/ledger"
 	"math/big"
 	"time"
 )
 
 // testNetPowLimit is the highest proof of work value a block can
-// have for the test network. It is the value 2^208 - 1.
-var testNetPowLimit = new(big.Int).Sub(new(big.Int).Lsh(common.Big1, 208), common.Big1)
+// have for the test network. It is the value 2^242 - 1.
+var testNetPowLimit = new(big.Int).Sub(new(big.Int).Lsh(common.Big1, 242), common.Big1)
+var maxNetPowLimit = new(big.Int).Sub(new(big.Int).Lsh(common.Big1, 0), common.Big1)
 
 // target time per block unit second(s)
 const testTargetTimePerBlock = 30
@@ -26,60 +29,56 @@ const testWorkDiffWindowSize = 60
 
 // TestNetParams defines the network parameters for the test network.
 var TestNetParams = Params{
-	Name:        "testnet",
-	Net:         protocol.TestNet,
-	DefaultPort: "18130",
-	DNSSeeds: []DNSSeed{
-		{"testnet-seed.hlcwallet.info", true},
-		{"testnet-seed.qitmeer.xyz", true},
-		{"seed.qitmir.info", true},
+	Name:           "testnet",
+	Net:            protocol.TestNet,
+	DefaultPort:    "18150",
+	DefaultUDPPort: 18160,
+	Bootstrap: []string{
+		"/dns4/node.meerscan.io/tcp/28130/p2p/16Uiu2HAmTdcrQ2S4MD6UxeR81Su8DQdt2eB7vLzJA7LrawNf93T2",
+		"/dns4/ns-cn.qitmeer.xyz/tcp/18150/p2p/16Uiu2HAm45YEQXf5sYgpebp1NvPS96ypvvpz5uPx7iPHmau94vVk",
+		"/dns4/ns.qitmeer.top/tcp/28230/p2p/16Uiu2HAmRtp5CjNv3WvPYuh7kNXXZQDYegwFFeDH9vWY3JY4JS1W",
+		"/dns4/boot.qitmir.info/tcp/2001/p2p/16Uiu2HAmJ8qBBgoNoHH84ntLuXB9sqDngh82zZgaEejdFUYGR59Y",
 	},
-
+	LedgerParams: ledger.LedgerParams{ // lock tx release rule in genesis
+		GenesisAmountUnit: 1000 * 1e8, // 1000 MEER every utxo
+		MaxLockHeight:     2880 * 365 * 5,
+	},
 	// Chain parameters
 	GenesisBlock: &testNetGenesisBlock,
 	GenesisHash:  &testNetGenesisHash,
 	PowConfig: &pow.PowConfig{
-		Blake2bdPowLimit:             testNetPowLimit,
-		Blake2bdPowLimitBits:         0x1b7fffff, // compact from of testNetPowLimit (2^215-1)
-		X16rv3PowLimit:               testNetPowLimit,
-		X16rv3PowLimitBits:           0x1b7fffff, // compact from of testNetPowLimit (2^215-1)
-		X8r16PowLimit:                testNetPowLimit,
-		X8r16PowLimitBits:            0x1b7fffff, // compact from of testNetPowLimit (2^215-1)
-		QitmeerKeccak256PowLimit:     testNetPowLimit,
-		QitmeerKeccak256PowLimitBits: 0x1b00ffff, // compact from of testNetPowLimit (2^208-1) 453050367
+		Blake2bdPowLimit:             maxNetPowLimit,
+		Blake2bdPowLimitBits:         0x0, // compact from of testNetPowLimit 0
+		X16rv3PowLimit:               maxNetPowLimit,
+		X16rv3PowLimitBits:           0x0, // compact from of testNetPowLimit 0
+		X8r16PowLimit:                maxNetPowLimit,
+		X8r16PowLimitBits:            0x0, // compact from of testNetPowLimit 0
+		QitmeerKeccak256PowLimit:     maxNetPowLimit,
+		QitmeerKeccak256PowLimitBits: 0x0, // compact from of testNetPowLimit 0
+		MeerXKeccakV1PowLimit:        testNetPowLimit,
+		MeerXKeccakV1PowLimitBits:    0x1f0198f2, // compact from of testNetPowLimit (2^242-1)
 		//hash ffffffffffffffff000000000000000000000000000000000000000000000000 corresponding difficulty is 48 for edge bits 24
 		// Uniform field type uint64 value is 48 . bigToCompact the uint32 value
 		// 24 edge_bits only need hash 1*4 times use for privnet if GPS is 2. need 50 /2 * 4 = 1min find once
-		CuckarooMinDifficulty:  0x2018000, // 96 * 4 = 384
-		CuckatooMinDifficulty:  0x2074000, // 1856
-		CuckaroomMinDifficulty: 0x34ad1ec, // compact : 55235052 diff : 4903404
+		CuckarooMinDifficulty:  0x87fffff, // diff: max int64
+		CuckatooMinDifficulty:  0x87fffff, // diff: max int64
+		CuckaroomMinDifficulty: 0x87fffff, // diff: max int64
 
-		Percent: []pow.Percent{
-			{
-				Blake2bDPercent:         0,
-				X16rv3Percent:           0,
-				QitmeerKeccak256Percent: 30,
-				CuckaroomPercent:        70,
-				CuckatooPercent:         0,
-				MainHeight:              0,
-			},
-			{
-				Blake2bDPercent:         0,
-				X16rv3Percent:           0,
-				QitmeerKeccak256Percent: 100,
-				CuckaroomPercent:        0,
-				CuckatooPercent:         0,
-				// | time	| timestamp	| mainHeight |
-				// | ---| --- | --- |
-				// | 2020-08-30 10:31:46 | 1598754706 | 192266
-				// | 2020-09-15 12:00 | 1600142400 | 238522
-				// The soft forking mainHeight was calculated according to the average time of 30s
-				// In other words, pmeer will be produced by the pow of QitmeerKeccak256 only after mainHeight arrived 238522
-				MainHeight: 238522,
+		Percent: map[pow.MainHeight]pow.PercentItem{
+			pow.MainHeight(0): {
+				pow.MEERXKECCAKV1: 100,
 			},
 		},
 		// after this height the big graph will be the main pow graph
 		AdjustmentStartMainHeight: 365 * 1440 * 60 / testTargetTimePerBlock,
+	},
+	CoinbaseConfig: CoinbaseConfigs{
+		{
+			Height:                    61279,
+			Version:                   "0.10.4",
+			ExtraDataIncludedVer:      true,
+			ExtraDataIncludedNodeInfo: true,
+		},
 	},
 	ReduceMinDifficulty:      false,
 	MinDiffReductionTime:     0, // Does not apply since ReduceMinDifficulty false
@@ -96,12 +95,11 @@ var TestNetParams = Params{
 	// Subsidy parameters.
 	BaseSubsidy:              12000000000, // 120 Coin , daily supply is 120*2*60*24 = 345600 ~ 345600 * 2 (DAG factor)
 	MulSubsidy:               100,
-	DivSubsidy:               10000000000000,   // Coin-base reward reduce to zero at 1540677 blocks created
-	SubsidyReductionInterval: 1669066 - 541194, // 120 * 1669066 (blocks) *= 200287911 (200M) -> 579 ~ 289 days
-	// && subsidy has to reduce the 0.8.5 mining_rewarded blocks (541194)
-	WorkRewardProportion:  10,
-	StakeRewardProportion: 0,
-	BlockTaxProportion:    0,
+	DivSubsidy:               10000000000000, //
+	SubsidyReductionInterval: math.MaxInt64,
+	WorkRewardProportion:     10,
+	StakeRewardProportion:    0,
+	BlockTaxProportion:       0,
 
 	// Maturity
 	CoinbaseMaturity: 720, // coinbase required 720 * 30 = 6 hours before repent
@@ -109,18 +107,14 @@ var TestNetParams = Params{
 	// Checkpoints ordered from oldest to newest.
 	Checkpoints: []Checkpoint{},
 
-	// Consensus rule change deployments.
-	//
-	Deployments: map[uint32][]ConsensusDeployment{},
-
 	// Address encoding magics
 	NetworkAddressPrefix: "T",
-	PubKeyAddrID:         [2]byte{0x0f, 0x0f}, // starts with Tk
-	PubKeyHashAddrID:     [2]byte{0x0f, 0x12}, // starts with Tm
+	PubKeyAddrID:         [2]byte{0x28, 0xf5}, // starts with Tk
+	PubKeyHashAddrID:     [2]byte{0x0f, 0x14}, // starts with Tn (to distinguish 0.9.x testnet)
 	PKHEdwardsAddrID:     [2]byte{0x0f, 0x01}, // starts with Te
 	PKHSchnorrAddrID:     [2]byte{0x0f, 0x1e}, // starts with Tr
 	ScriptHashAddrID:     [2]byte{0x0e, 0xe2}, // starts with TS
-	PrivateKeyID:         [2]byte{0x0c, 0xe2}, // starts with Pt
+	PrivateKeyID:         [2]byte{0x23, 0x0b}, // starts with Pt
 
 	// BIP32 hierarchical deterministic extended key magics
 	HDPrivateKeyID: [4]byte{0x04, 0x35, 0x83, 0x97}, // starts with tprv
@@ -128,7 +122,7 @@ var TestNetParams = Params{
 
 	// BIP44 coin type used in the hierarchical deterministic path for
 	// address generation.
-	HDCoinType: 223,
-
-	//OrganizationPkScript:  hexMustDecode("76a914868b9b6bc7e4a9c804ad3d3d7a2a6be27476941e88ac"),
+	HDCoinType:         223,
+	OrganizationPkScript: hexMustDecode("76a91429209320e66d96839785dd07e643a7f1592edc5a88ac"),
+	TokenAdminPkScript: hexMustDecode("00000000c96d6d76a914b8834294977b26a44094fe2216f8a7d59af1130888ac"),
 }

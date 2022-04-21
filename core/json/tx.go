@@ -35,11 +35,16 @@ type Vin struct {
 	Vout      uint32     `json:"vout"`
 	Sequence  uint32     `json:"sequence"`
 	ScriptSig *ScriptSig `json:"scriptSig"`
+	TxType    string     `json:"type,omitempty"`
 }
 
 // IsCoinBase returns a bool to show if a Vin is a Coinbase one or not.
 func (v *Vin) IsCoinBase() bool {
 	return len(v.Coinbase) > 0
+}
+
+func (v *Vin) IsNonStd() bool {
+	return len(v.TxType) > 0
 }
 
 // MarshalJSON provides a custom Marshal method for Vin.
@@ -51,6 +56,16 @@ func (v *Vin) MarshalJSON() ([]byte, error) {
 		}{
 			Coinbase: v.Coinbase,
 			Sequence: v.Sequence,
+		}
+		return json.Marshal(coinbaseStruct)
+	}
+	if v.IsNonStd() {
+		coinbaseStruct := struct {
+			Type      string     `json:"type"`
+			ScriptSig *ScriptSig `json:"scriptSig"`
+		}{
+			Type:      v.TxType,
+			ScriptSig: v.ScriptSig,
 		}
 		return json.Marshal(coinbaseStruct)
 	}
@@ -72,7 +87,9 @@ func (v *Vin) MarshalJSON() ([]byte, error) {
 // Vout models parts of the tx data.  It is defined separately since both
 // getrawtransaction and decoderawtransaction use the same structure.
 type Vout struct {
-	Amount       uint64             `json:"amount"`
+	Coin         string             `json:"coin,omitempty"`
+	CoinId       uint16             `json:"coinid,omitempty"`
+	Amount       uint64             `json:"amount,omitempty"`
 	ScriptPubKey ScriptPubKeyResult `json:"scriptPubKey"`
 }
 
@@ -98,6 +115,7 @@ type ScriptSig struct {
 type GetUtxoResult struct {
 	BestBlock     string             `json:"bestblock"`
 	Confirmations int64              `json:"confirmations"`
+	CoinId        uint16             `json:"coinId"`
 	Amount        float64            `json:"amount"`
 	ScriptPubKey  ScriptPubKeyResult `json:"scriptPubKey"`
 	Version       int32              `json:"version"`
@@ -133,5 +151,39 @@ type VinPrevOut struct {
 
 type PrevOut struct {
 	Addresses []string `json:"addresses,omitempty"`
+	CoinId    uint16   `json:"coinId"`
 	Value     float64  `json:"value"`
 }
+
+type DecodeRawTransactionResult struct {
+	Order      uint64 `json:"order"`
+	BlockHash  string `json:"blockhash"`
+	Txvalid    bool   `json:"txvalid"`
+	Duplicate  bool   `json:"duplicate,omitempty"`
+	IsCoinbase bool   `json:"is_coinbase"`
+	Confirms   uint64 `json:"confirms"`
+	IsBlue     bool   `json:"is_blue"`
+	Txid       string `json:"txid"`
+	Hash       string `json:"txhash"`
+	Version    uint32 `json:"version"`
+	LockTime   uint32 `json:"locktime"`
+	Time       string `json:"timestamp"`
+	Vin        []Vin  `json:"vin"`
+	Vout       []Vout `json:"vout"`
+}
+
+// TransactionInput represents the inputs to a transaction.  Specifically a
+// transaction hash and output number pair.
+type TransactionInput struct {
+	Txid string `json:"txid"`
+	Vout uint32 `json:"vout"`
+}
+
+type Amounts map[string]uint64 //{\"address\":amount,...}
+
+type Amout struct {
+	CoinId uint16 `json:"coinid"`
+	Amount int64  `json:"amount"`
+}
+
+type AdreesAmount map[string]Amout

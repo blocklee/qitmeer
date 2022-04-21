@@ -58,7 +58,7 @@ func (ph *Phantom_v2) Init(bd *BlockDAG) bool {
 }
 
 // Add a block
-func (ph *Phantom_v2) AddBlock(b IBlock) *list.List {
+func (ph *Phantom_v2) AddBlock(b IBlock) (*list.List, *list.List) {
 	if ph.blocks == nil {
 		ph.blocks = map[hash.Hash]*PhantomBlock{}
 	}
@@ -72,7 +72,7 @@ func (ph *Phantom_v2) AddBlock(b IBlock) *list.List {
 	result := list.New()
 	result.PushBack(pb)
 
-	return result
+	return result, nil
 }
 
 // Build self block
@@ -83,15 +83,6 @@ func (ph *Phantom_v2) CreateBlock(b *Block) IBlock {
 // If the successor return nil, the underlying layer will use the default tips list.
 func (ph *Phantom_v2) GetTipsList() []IBlock {
 	return nil
-}
-
-// Find block hash by order, this is very fast.
-func (ph *Phantom_v2) GetBlockByOrder(order uint) *hash.Hash {
-	ph.updateAntipastColoring()
-	if order >= ph.bd.blockTotal {
-		return nil
-	}
-	return ph.bd.GetBlockHash(ph.bd.order[order])
 }
 
 // Query whether a given block is on the main chain.
@@ -439,6 +430,11 @@ func (ph *Phantom_v2) updateAntipastColoring() {
 // return the tip of main chain
 func (ph *Phantom_v2) GetMainChainTip() IBlock {
 	return nil
+}
+
+// return the tip of main chain id
+func (ph *Phantom_v2) GetMainChainTipId() uint {
+	return 0
 }
 
 // return the main parent in the parents
